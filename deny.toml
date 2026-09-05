@@ -1,0 +1,76 @@
+# cargo-deny: licences, advisories, sources and duplicate versions.
+#
+# People flash cameras with these binaries, so supply-chain hygiene is load-bearing.
+# CI runs `cargo deny check` on every push.
+
+[graph]
+# Every target the workspace ships to. A dependency that is only ever pulled in
+# for some other platform is not this project's problem.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "wasm32-unknown-unknown",
+    "aarch64-linux-android",
+]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# The workspace is GPL-2.0-or-later. Everything here is compatible with distributing a
+# GPLv2-or-later binary; permissive licences only, plus our own.
+# Exactly what the graph contains today: an addition is a reviewed change, not a
+# convenience. `cargo deny list` prints the current set.
+allow = [
+    "GPL-2.0-or-later", # the workspace itself
+    "Apache-2.0",
+    "MIT",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unicode-3.0",
+    # webpki-roots: the Mozilla CA root store, licensed as data. Permissive, and
+    # distributing it inside a GPLv2-or-later binary is fine.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+# `thiserror-impl` moved to syn 3 while `wasm-bindgen-macro-support` is still on syn 2.
+# Both are proc-macro-only; neither reaches a shipped artifact.
+#
+# An entry that reports `unnecessary-skip` (a warning, not a failure) is kept rather than
+# deleted when the crate that brings the duplicate back is one the workspace still builds
+# for another target: removing it would turn that into a CI failure someone has to
+# rediscover.
+skip = [
+    { crate = "syn", reason = "proc-macro parser, build-time only" },
+    # Two Windows bindings majors coexist: `nusb` -> `windows-sys` 0.61, and xtask's
+    # `ureq` -> `ring` -> `windows-sys` 0.52 (re-measured 2026-08-23; the old
+    # rustix/errno route no longer exists). Neither compiles for Linux, macOS, wasm or
+    # Android, i.e. never for the bench or a camera. cargo-deny may warn this skip is
+    # unnecessary when it resolves for Linux only; it is kept for the day the target
+    # set includes Windows.
+    { crate = "windows-sys", reason = "nusb pulls 0.61; xtask's ureq/ring pulls 0.52; Windows-only, never on the bench" },
+    # `tdfu-jni`'s `jni` 0.21 (the Android drop-in; chosen for its stable classic API so
+    # the app loads the `.so` unchanged) still depends on `thiserror` 1, while the
+    # workspace is on `thiserror` 2. Both are permissively licensed and reach only the
+    # Android artifact. `jni` 0.22 is on `thiserror` 2 and would drop these two skips, at
+    # the cost of its API redesign - a trade worth revisiting deliberately.
+    { crate = "thiserror", reason = "jni 0.21 pulls thiserror 1 alongside the workspace's thiserror 2; Android-only" },
+    { crate = "thiserror-impl", reason = "the proc-macro half of the thiserror-1/2 split above" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,27 @@
+[package]
+name = "xtask"
+description = "Build automation for the thingino-dfu Rust workspace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../README.md"
+publish = false
+
+[dependencies]
+# rustls only: an OpenSSL dependency would put a C toolchain back in the build.
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+sha2 = { version = "0.10", default-features = false, features = ["std"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+tar = { version = "0.4", default-features = false }
+# The releases API that lists the loaders answers in JSON; the packager reads the workspace
+# version out of the root Cargo.toml.
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }
+
+[lints]
+workspace = true

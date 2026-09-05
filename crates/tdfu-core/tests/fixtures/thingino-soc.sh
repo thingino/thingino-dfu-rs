@@ -1,0 +1,238 @@
+# Copied verbatim from thingino-firmware package/thingino-system/files/soc (2026-08-22),
+# the on-device SoC identification script; test fixture for T4.
+#!/bin/sh
+# shellcheck disable=SC2004,SC2086
+
+read_cpuid() {
+	cpuid_raw=$(devmem 0x1300002C)
+	cpuid=$((($cpuid_raw >> 12) & 0xFFFF))
+}
+
+read_cppsr() {
+	cppsr_raw=$(devmem 0x10000034)
+	cppsr=$(($cppsr_raw & 0xFF))
+}
+
+read_subrm() {
+	subrm_raw=$(devmem 0x13540231)
+	subrm=$((($subrm_raw >> 8) & 0xFF))
+}
+
+read_type1() {
+	type1_raw=$(devmem 0x13540238)
+	type1=$((($type1_raw >> 16) & 0xFFFF))
+}
+
+read_type2() {
+	type2_raw=$(devmem 0x13540250)
+	type2=$((($type2_raw >> 16) & 0xFFFF))
+}
+
+read_t33id() {
+	# T33 variant selector: byte at 0x1354021f (byte 3 of the word at 0x1354021C),
+	# not type1/type2 like the other families.
+	t33id_raw=$(devmem 0x1354021C)
+	t33id=$((($t33id_raw >> 24) & 0xFF))
+}
+
+print_soc_clocks() {
+	cpu_speed=$(grep "apll" /proc/jz/clock/clocks | head -1 | awk '{for(i=1;i<=NF;i++) if($i ~ /MHz/) print $i}')
+	echo "CPU Speed: $cpu_speed"
+
+	if [ "$(print_soc_family)" = "a1" ]; then
+		ddr_speed=$(grep "div_ddr" /proc/jz/clock/clocks | head -1 | awk '{for(i=1;i<=NF;i++) if($i ~ /MHz/) print $i}')
+		echo "DDR Speed: $ddr_speed"
+	else
+		ddr_speed=$(awk '/cgu_ddr/{print $3}' /proc/jz/clock/clocks | head -1)
+		echo "DDR Speed: $ddr_speed"
+		isp_speed=$(awk '/isp/ && $2=="isp"{print $3}' /proc/jz/clock/clocks)
+		echo "ISP Speed: $isp_speed"
+	fi
+}
+
+print_wiki_line() {
+	read_cpuid
+	read_cppsr
+	read_subrm
+	read_type1
+	read_type2
+
+	printf "||| 0x%08x | 0x%04x | 0x%08x | 0x%02x | 0x%08x | 0x%02x | 0x%08x | 0x%04x | 0x%08x | 0x%04x |\n" \
+		"$cpuid_raw" "$cpuid" "$cppsr_raw" "$cppsr" "$subrm_raw" "$subrm" "$type1_raw" "$type1" "$type2_raw" "$type2"
+}
+
+print_soc_family() {
+	model=$(print_soc_model)
+
+	family=$(echo "$model" | sed 's/^qemu-//; s/\([at][0-9]*\).*/\1/')
+	echo $family
+}
+
+print_soc_model() {
+	read_cpuid
+	if [ "$cpuid" -eq $((0x40)) ]; then # Identify based only on cpuid and type2
+		read_type2
+		case "$type2" in
+			$((0x1111))) soc="t40n" ;;
+			#$((0x1111))) soc="t41n" ;; # overlap with t40nn, verify on chip
+			$((0x3333))) soc="t41l" ;;
+			$((0x4444))) soc="t41a" ;;
+			$((0x5555))) soc="t41zl" ;;
+			$((0x6666))) soc="t41zx" ;;
+			$((0x7777))) soc="t40xp" ;;
+			#$((0x7777))) soc="t41zn" ;; # overlap with t40xp
+			$((0x8888))) soc="t40nn" ;; # 0x8888 also names t41lc (same silicon, diff SKU)
+			$((0x9999))) soc="t41lq" ;;
+			$((0xAAAA))) soc="t41nq" ;;
+			$((0x2222))) soc="t41xq" ;;
+			$((0xBBBB))) soc="t41zm" ;;
+			$((0xCCCC))) soc="t41zg" ;;
+			*) soc="unknown_t4x" ;;
+		esac
+	elif [ "$cpuid" -eq $((0x1)) ]; then
+		read_type2
+		case "$type2" in
+			$((0x1111))) soc="a1n" ;;
+			$((0x2222))) soc="a1x" ;;
+			$((0x3333))) soc="a1l" ;;
+			$((0x4444))) soc="a1a" ;; # real vendor SKU (uboot a1a_ddr_para); 0x4444 by convention, confirm on a real A1A chip
+			$((0x5555))) soc="a1nt" ;;
+			*) soc="unknown_a1x" ;;
+		esac
+	elif [ "$cpuid" -eq $((0x33)) ]; then # T33: variant byte at 0x1354021f, not type1/type2
+		read_t33id
+		case "$t33id" in
+			$((0x99))) soc="t33l" ;;
+			$((0x33)) | $((0xAA))) soc="t33n" ;;
+			$((0x44))) soc="t33a" ;;
+			$((0x55))) soc="t33zl" ;;
+			$((0x77))) soc="t33zn" ;;
+			$((0xCC))) soc="t33vl" ;;
+			$((0xDD))) soc="t33vn" ;;
+			*) soc="unknown_t33" ;;
+		esac
+	else
+		# For all other chips, use type1
+		read_type1
+		cpu_sig=$(printf '0x%08X' $(((cpuid << 16) | $type1)))
+		case "$cpu_sig" in
+			0x00050000) soc="t10" ;;
+			# C100 is a die-shrink of T31A (cpuid 0x31 / type1 0x4444 -> detected as t31a above);
+			# no distinct C100 chip id exists. (old guess: #0x01011111) soc="c100")
+			0x20000000) soc="t20ax" ;;
+			0x20001111) soc="t20n" ;;
+			0x20002222) soc="t20x" ;;
+			0x20003333) soc="t20l" ;;
+			0x20006666) soc="t20z" ;;
+			0x00211111) soc="t21n" ;;
+			0x00212222) soc="t21x" ;; # 0x2222 by T-family convention; confirm on a t21x chip
+			0x00213333) soc="t21l" ;;
+			0x00215555) soc="t21z" ;;
+			0x00231111) soc="t23n" ;;
+			0x00232222) soc="t23x" ;;
+			0x00233333) soc="t23dl" ;;
+			0x00235555) soc="t23dn" ;;
+			0x00236666) soc="t23zx" ;;
+			0x00237777) soc="t23zn" ;;
+			0x00301111) soc="t30n" ;;
+			0x00302222) soc="t30x" ;;
+			0x00303333) soc="t30l" ;;
+			0x00304444) soc="t30a" ;;
+			0x00305555) soc="t30z" ;;
+			0x00311111) soc="t31n" ;;
+			0x00312222) soc="t31x" ;;
+			0x00313333) soc="t31l" ;;
+			0x00314444) soc="t31a" ;;
+			0x00315555) soc="t31zl" ;;
+			0x00316666) soc="t31zx" ;;
+			0x0031CCCC) soc="t31al" ;;
+			0x0031DDDD) soc="t31zc" ;;
+			0x0031EEEE) soc="t31lc" ;;
+			0x00329999) soc="t32lq" ;;
+			0x0032AAAA) soc="t32nq" ;;
+			0x0005EE00) soc="qemu-t10" ;;
+			0x0020EE00) soc="qemu-t20" ;;
+			0x0021EE00) soc="qemu-t21" ;;
+			0x0023EE00) soc="qemu-t23" ;;
+			0x0030EE00) soc="qemu-t30" ;;
+			0x0031EE00) soc="qemu-t31" ;;
+			0x0032EE00) soc="qemu-t32" ;;
+			0x0033EE00) soc="qemu-t33" ;;
+			*)
+				echo "Unknown SoC signature: $cpu_sig" >&2
+				soc="unknown"
+				;;
+		esac
+	fi
+
+	echo $soc
+}
+
+print_soc_architecture() {
+	while read -r line; do
+		case "$line" in
+			*"cpu model"*"Ingenic Xburst V0.0"*)
+				echo "XBurst1"
+				return
+				;;
+		esac
+	done </proc/cpuinfo
+
+	echo "XBurst2"
+}
+
+print_serial_number() {
+	# Read all 4 serial number parts in one loop
+	serial=""
+	for addr in 0x13540200 0x13540204 0x13540208 0x1354023C; do
+		val=$(devmem $addr 2>/dev/null)
+		if [ -z "$val" ]; then
+			echo "Error: Unable to read serial number" >&2
+			return 1
+		fi
+		# Convert hex to decimal and concatenate
+		serial="${serial}$(printf "%u" $val)"
+	done
+
+	echo "$serial"
+}
+
+show_usage() {
+	echo "Usage: $0 [-c|-f|-m|-w|-a|-s]
+	-m	SoC model
+	-f	SoC family
+	-w	raw info for wiki
+	-a	CPU architecture
+	-c	CPU Clocks
+	-s	Serial number
+" >&2
+}
+
+case "$1" in
+	-c)
+		print_soc_clocks
+		;;
+	-f)
+		print_soc_family
+		;;
+	-m)
+		print_soc_model
+		;;
+	-w)
+		print_wiki_line
+		;;
+	-a)
+		print_soc_architecture
+		;;
+	-s)
+		print_serial_number
+		;;
+	"")
+		print_soc_model
+		;;
+	*)
+		show_usage
+		;;
+esac
+
+exit 0

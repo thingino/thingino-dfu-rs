@@ -1,0 +1,22 @@
+{
+  "name": "thingino-dfu-web",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "stub": "node test/make-seam-stub.mjs",
+    "test": "node test/make-seam-stub.mjs --force && node --test test/*.test.mjs",
+    "test:remote": "node test/remote.spec.cjs"
+  },
+  "dependencies": {
+    "@fontsource/montserrat": "^5.0.0",
+    "bootstrap": "^5.3.8",
+    "bootstrap-icons": "^1.13.1"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0"
+  }
+}

@@ -1,0 +1,30 @@
+# Cross-compilation linkers. Every entry is resolved from PATH: nothing here may
+# name a machine-specific path. The Android NDK linker is not
+# listed because its path is installation-specific - CI and local builds set
+# CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER instead.
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+
+# Every WebUSB binding in `web-sys` 0.3 sits behind `--cfg=web_sys_unstable_apis` (each
+# generated item carries `#[cfg(web_sys_unstable_apis)]`; the API is a WICG draft rather
+# than a W3C recommendation). Without this flag `tdfu-wasm`'s backend does not compile at
+# all, so it belongs in the build configuration and not in an environment variable
+# somebody has to remember - CI, `cargo xtask web` and every local gate all read
+# this file.
+#
+# `cfg(all())` matches every target on purpose, not just wasm32: it is what makes
+# `cargo clippy --workspace --all-targets` and `cargo test --workspace` compile the
+# WebUSB backend on the host, where `wasm-bindgen`'s non-wasm mode turns each binding
+# into a stub. Restricting it to `wasm32-unknown-unknown` would leave the crate's largest
+# module unlinted by the gate.
+#
+# NOTE: a `RUSTFLAGS` environment variable REPLACES these rather than adding to them.
+# Anything that sets it must include `--cfg=web_sys_unstable_apis`.
+[target.'cfg(all())']
+rustflags = ["--cfg=web_sys_unstable_apis"]
+
+[alias]
+xtask = "run --package xtask --"

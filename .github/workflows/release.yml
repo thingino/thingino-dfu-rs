@@ -1,0 +1,419 @@
+name: Release
+
+# A tag push publishes; nothing else does.
+#
+# `dry_run` defaults to **true** so that the ordinary way to exercise this file - a
+# `workflow_dispatch` on a branch - builds and uploads all six archives and publishes
+# nothing. Only a tag *push* reaches `gh release create`: the publish step gates on
+# `github.event_name == 'push'` as well as the tag ref, so a dispatch pointed at a tag ref
+# with `dry_run=false` cannot publish either.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and upload the artifacts, publish nothing
+        type: boolean
+        default: true
+
+# Read-only for every job. Only `release` widens it, and only to `contents: write`.
+permissions:
+  contents: read
+
+# Never cancel a release in flight: a half-uploaded set of artifacts is worse than a
+# duplicate run, and a tag runs once.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # The gate, before anything is built and long before anything is published. A tag can sit
+  # on any commit: one no CI run ever saw, one whose run was cancelled, one pushed to a
+  # branch with the pre-push hook skipped. "The gate was green on main" is therefore not a
+  # property of the tree being released, so the tag runs it itself. This calls ci.yml as a
+  # reusable workflow rather than restating its steps, so there is one copy of the rules;
+  # every packaging job below waits on it, which is what stops an ungated tree reaching
+  # `gh release create`.
+  gate:
+    name: gate
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  # The three cross targets that build on a Linux runner. Same recipes as ci.yml's build
+  # matrix - the same apt packages for the same reasons (the aarch64 leg needs
+  # `libc6-dev-arm64-cross` as well as the compiler, or the link fails on a missing
+  # `Scrt1.o`), the same `rustup target add`. No NDK is installed in this matrix: Android
+  # is built by the `build-android` job below, which finds the runner's own NDK, and its
+  # tarball is published with the rest of this release.
+  #
+  # Every step is one `cargo xtask package` call, and that is the point: the job body is a
+  # thin wrapper, so `cargo xtask package --target <name>` on a laptop produces the same
+  # archive as this runner and the two cannot drift.
+  build:
+    needs: gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+          - name: linux-aarch64
+            target: aarch64-unknown-linux-gnu
+            apt: gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          - name: windows-x64
+            target: x86_64-pc-windows-gnu
+            apt: gcc-mingw-w64-x86-64
+    name: package (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # No actions here either, for ci.yml's reason: plain git and the gh CLI do
+      # everything, and the only exceptions are the artifact pair, pinned by commit sha.
+      - name: Check out
+        run: |
+          git init -q .
+          # The token on the fetch, never in .git/config: see ci.yml's gate job.
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c http.extraheader="AUTHORIZATION: basic $auth" \
+            fetch -q --depth 1 --no-tags "https://github.com/${GITHUB_REPOSITORY}" "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+
+      # The banner's hash, for both binaries, from the commit being released. `cargo xtask
+      # package` would derive the same value from the checkout; setting it here makes the
+      # workflow the authority and keeps a shallow checkout's oddities out of it.
+      - name: Build identity
+        run: echo "TDFU_GIT_HASH=$(git rev-parse --short=7 "$GITHUB_SHA")" >> "$GITHUB_ENV"
+
+      - name: Cross toolchain
+        if: matrix.apt != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ matrix.apt }}
+
+      - name: Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      # Builds the binaries, fetches the pinned loader tree if this checkout has none
+      # (decision D2), assembles dist/thingino-dfu-<name>/ and writes the archive plus its
+      # SHA256SUMS line. The packager fetches the loader tree itself when the checkout has
+      # none, and that is one GitHub API request: without the token it shares the runner's
+      # unauthenticated per-address quota, which the macOS pool exhausted (a 403) on the
+      # first tag run. Every Package step carries the token for that reason.
+      - name: Package
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo xtask package --target ${{ matrix.target }}
+
+      - name: What was built
+        run: |
+          ls -l dist
+          cat dist/SHA256SUMS
+
+      # Belt to the round-trip test's suspenders: open the built zip with a
+      # tool that is not this repo's writer. python3 ships on the runner; a bad central
+      # directory, a wrong CRC or a zlib-wrapped stream fails here at the commit that
+      # caused it, not on a Windows user's machine.
+      - name: The zip opens in an independent tool
+        if: matrix.name == 'windows-x64'
+        run: python3 -m zipfile -t dist/thingino-dfu-windows-x64.zip
+
+      - name: Upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: thingino-dfu-${{ matrix.name }}
+          path: |
+            dist/thingino-dfu-${{ matrix.name }}.*
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  # macOS is its own job for the reason ci.yml records: a job-level `if` may use the
+  # github context but NOT matrix, and this leg has historically needed one. It also needs
+  # a macOS runner for `lipo`, which the matrix above cannot give it.
+  #
+  # `cargo xtask package --target macos-universal` builds both apple triples and runs the
+  # same two `lipo -create` calls ci.yml's build-macos job runs, so this body stays one
+  # line and the recipe lives in one place.
+  build-macos:
+    needs: gate
+    name: package (macos-universal)
+    runs-on: macos-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out
+        run: |
+          git init -q .
+          # The token on the fetch, never in .git/config: see ci.yml's gate job.
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c http.extraheader="AUTHORIZATION: basic $auth" \
+            fetch -q --depth 1 --no-tags "https://github.com/${GITHUB_REPOSITORY}" "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+
+      - name: Build identity
+        run: echo "TDFU_GIT_HASH=$(git rev-parse --short=7 "$GITHUB_SHA")" >> "$GITHUB_ENV"
+
+      - name: Rust targets
+        run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+
+      - name: Package
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo xtask package --target macos-universal
+
+      - name: What was built
+        run: |
+          ls -l dist
+          file dist/thingino-dfu-macos-universal/thingino-dfu
+          cat dist/SHA256SUMS
+
+      - name: Upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: thingino-dfu-macos-universal
+          path: |
+            dist/thingino-dfu-macos-universal.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  # The web flasher: the same four steps ci.yml's wasm leg runs, then the packaging call.
+  # `cargo xtask package --target web` never builds the page - it archives `web/dist` and
+  # refuses one that has no `firmware/dfu/` in it, because a loader-less web tarball 404s
+  # at every bootstrap and is what `xtask fetch-loaders` fills from the usbboot release.
+  build-web:
+    needs: gate
+    name: package (web)
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out
+        run: |
+          git init -q .
+          # The token on the fetch, never in .git/config: see ci.yml's gate job.
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c http.extraheader="AUTHORIZATION: basic $auth" \
+            fetch -q --depth 1 --no-tags "https://github.com/${GITHUB_REPOSITORY}" "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+
+      - name: Build identity
+        run: echo "TDFU_GIT_HASH=$(git rev-parse --short=7 "$GITHUB_SHA")" >> "$GITHUB_ENV"
+
+      - name: Rust target
+        run: rustup target add wasm32-unknown-unknown
+
+      # `wasm-bindgen` and `wasm-bindgen-test-runner` are two binaries of one tool and must
+      # match the crate the workspace resolved to; the version comes from `cargo xtask web`,
+      # which is the same reader the build itself checks against, as in ci.yml.
+      - name: wasm-bindgen CLI
+        run: |
+          ver=$(cargo xtask web --print-wasm-bindgen-version)
+          test -n "$ver" || { echo "cargo xtask web could not resolve wasm-bindgen"; exit 1; }
+          echo "wasm-bindgen $ver"
+          asset="wasm-bindgen-${ver}-x86_64-unknown-linux-musl.tar.gz"
+          gh release download "$ver" -R wasm-bindgen/wasm-bindgen --pattern "$asset" --dir /tmp --clobber
+          tar xzf "/tmp/$asset" -C /tmp --strip-components 1
+          mkdir -p "$HOME/.cargo/bin"
+          install -m 0755 /tmp/wasm-bindgen "$HOME/.cargo/bin/wasm-bindgen"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          command -v wasm-bindgen
+
+      # The page fetches firmware/dfu/<variant>/{tpl,spl,uboot}.bin for a local bootstrap,
+      # and `cargo xtask web` links that tree into web/public only when one has been
+      # fetched, as in ci.yml. Before the page build, not after.
+      - name: Loader tree
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo xtask fetch-loaders
+
+      - name: Build the web flasher
+        run: |
+          node --version
+          major=$(node -p 'process.versions.node.split(".")[0]')
+          if [ "$major" -lt 20 ] || [ "$major" -eq 21 ]; then
+            echo "vite wants node 20, 22 or newer; this is $major"
+            exit 1
+          fi
+          cargo xtask web --release
+
+      - name: Package
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo xtask package --target web
+
+      - name: What was built
+        run: |
+          ls -l dist
+          cat dist/SHA256SUMS
+
+      - name: Upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: thingino-dfu-web
+          path: |
+            dist/thingino-dfu-web.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  # The Android drop-in for thingino-app: libtdfu_jni.so per ABI plus the loader assets, in
+  # the layout the app's Gradle unpacks. GitHub's ubuntu-latest ships an
+  # NDK at $ANDROID_NDK_LATEST_HOME, which `cargo xtask package --target android` finds on
+  # its own (the same env var ci.yml's android leg reads), so no NDK is installed here. The
+  # ten-symbol parity and the stray-NEEDED check run inside the packaging step, against each
+  # built .so, so this job body is one `cargo xtask package` call like the others.
+  build-android:
+    needs: gate
+    name: package (android)
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out
+        run: |
+          git init -q .
+          # The token on the fetch, never in .git/config: see ci.yml's gate job.
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c http.extraheader="AUTHORIZATION: basic $auth" \
+            fetch -q --depth 1 --no-tags "https://github.com/${GITHUB_REPOSITORY}" "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+
+      - name: Build identity
+        run: echo "TDFU_GIT_HASH=$(git rev-parse --short=7 "$GITHUB_SHA")" >> "$GITHUB_ENV"
+
+      - name: Rust targets
+        run: rustup target add aarch64-linux-android armv7-linux-androideabi
+
+      - name: Package
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo xtask package --target android
+
+      - name: What was built
+        run: |
+          ls -l dist
+          cat dist/SHA256SUMS
+
+      - name: Upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: libtdfu-android
+          path: |
+            dist/libtdfu-android-*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  # The only job that can write anything, and only when a tag pushed it.
+  #
+  # There is deliberately no Pages deploy here: where the flasher is served is a cutover
+  # question, not this release's.
+  release:
+    name: release
+    needs: [build, build-macos, build-web, build-android]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out
+        run: |
+          git init -q .
+          # The token on the fetch, never in .git/config: see ci.yml's gate job.
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c http.extraheader="AUTHORIZATION: basic $auth" \
+            fetch -q --depth 1 --no-tags "https://github.com/${GITHUB_REPOSITORY}" "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+
+      # The download half of the one pinned action pair; `gh` has no equivalent for a
+      # workflow artifact, which needs the runtime token only the action carries. Pinned
+      # by commit sha (v8.0.1, verified against the GitHub API) exactly as ci.yml pins the
+      # upload half.
+      - name: Download the artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+
+      # Each job uploaded its own one-line SHA256SUMS beside its archive. Merge them into
+      # the file that is published, and gather the six archives into one directory. The
+      # publish step then names all six explicitly: a glob that quietly matched five
+      # would publish a release with a download missing, and the count check below is the
+      # other half of the same rule.
+      - name: Gather
+        run: |
+          mkdir -p publish
+          find artifacts -type f \( -name 'thingino-dfu-*.tar.gz' -o -name 'thingino-dfu-*.zip' -o -name 'libtdfu-android-*.tar.gz' \) \
+            -exec cp {} publish/ \;
+          find artifacts -type f -name SHA256SUMS -print0 | xargs -0 cat | sort -k2 > publish/SHA256SUMS
+          ls -l publish
+          cat publish/SHA256SUMS
+          # Six archives, no more and no fewer: a job that silently produced nothing must
+          # not become a release with a download missing.
+          count=$(find publish -type f \( -name 'thingino-dfu-*' -o -name 'libtdfu-android-*' \) | wc -l)
+          test "$count" -eq 6 || { echo "expected 6 archives, found $count"; exit 1; }
+          ( cd publish && sha256sum -c SHA256SUMS )
+
+      # The version the archives claim is the version the tag names, or nothing is
+      # published. The rule is a test in xtask, so it is the same check a person can run
+      # before tagging.
+      #
+      # A dispatch has no tag, so it asks the xtask which version this tree is and feeds
+      # that back in. Both answers come from `manifest_facts` over the same file in the
+      # same process, so this exercises the command - the flag, the exit code - and proves
+      # nothing about the rule. The rule itself is a test in xtask
+      # (`a_mismatched_tag_names_both_values`), and it runs for real only on a tag.
+      - name: The tag is this tree's version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            cargo xtask package --check-tag "$GITHUB_REF_NAME"
+          else
+            version=$(cargo xtask package --print-version)
+            echo "not a tag: this tree is $version, so its tag would be v$version"
+            cargo xtask package --check-tag "v$version"
+          fi
+
+      # A dispatch stops here, and says so. This is the leg that exercises the whole file
+      # without publishing.
+      - name: Dry run
+        if: "github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/v') || inputs.dry_run"
+        run: |
+          echo "Not a tag push, or dry_run was set: nothing is published."
+          echo "The six archives and SHA256SUMS are attached to this run as artifacts."
+
+      # `--generate-notes` writes the commit list, and it is the whole of the notes: there
+      # is no hand-written header, so this step reads no file and prepends nothing.
+      # `--prerelease` for any tag with a pre-release suffix, so an alpha or an rc never
+      # shows as Latest.
+      - name: Publish
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !inputs.dry_run
+        run: |
+          args=(--generate-notes)
+          # The prerelease decision is xtask's, not a shell glob: the line it prints is
+          # pinned by a test, so the gate that flips --prerelease and the tested logic are
+          # one function. The --check-tag also revalidates the tag here.
+          verdict=$(cargo xtask package --check-tag "$GITHUB_REF_NAME")
+          echo "$verdict"
+          if echo "$verdict" | grep -qx 'prerelease=true'; then
+            args+=(--prerelease)
+          fi
+          # The Android archive carries the version in its name (what the app pins). The
+          # check above has proven the tag and this version are the same release, so this is
+          # the tag's version - named explicitly, not globbed, like the other five.
+          version=$(cargo xtask package --print-version)
+          # The checkout above is a bare fetch with no remote configured, so gh cannot
+          # infer the repository from git; name it.
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            publish/thingino-dfu-linux-x86_64.tar.gz \
+            publish/thingino-dfu-linux-aarch64.tar.gz \
+            publish/thingino-dfu-windows-x64.zip \
+            publish/thingino-dfu-macos-universal.tar.gz \
+            publish/thingino-dfu-web.tar.gz \
+            "publish/libtdfu-android-${version}.tar.gz" \
+            publish/SHA256SUMS \
+            "${args[@]}"

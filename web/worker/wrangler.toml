@@ -1,0 +1,19 @@
+# Firmware proxy for the web flasher. Deliberately its own Worker, separate from
+# thingino-image-builder: that one owns D1, Durable Objects and a per-minute cron
+# for build orchestration, and a byte proxy needs none of it. Splitting them costs
+# nothing (the free request budget is account-wide) and keeps a bad deploy of one
+# from taking down the other.
+#
+#   deploy:  npx wrangler deploy          (from worker/)
+#   tail:    npx wrangler tail
+name = "thingino-dfu-fw"
+main = "src/index.js"
+compatibility_date = "2025-06-01"
+
+[vars]
+# Who may read the response. "*" is correct here: the Worker serves only public,
+# immutable thingino release assets, carries no cookies or credentials, and the
+# allow-list means a caller can reach nothing else through it. Pinning it to one
+# origin would buy no security and would break the local dev server, plus any
+# fork's own Pages deploy.
+ALLOW_ORIGIN = "*"
