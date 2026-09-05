@@ -1,0 +1,7 @@
+# Checked in and gated by `cargo fmt --check`. Stable options only:
+# an unstable key makes rustfmt fail on the pinned stable toolchain.
+edition = "2024"
+max_width = 120
+use_field_init_shorthand = true
+use_try_shorthand = true
+newline_style = "Unix"

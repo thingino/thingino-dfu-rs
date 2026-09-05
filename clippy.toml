@@ -1,0 +1,23 @@
+# Lint *configuration* (not an allow-list of lints - that lives in the workspace
+# manifest).
+#
+# `..` keeps clippy's own defaults and appends to them.
+# `WebUSB`/`WinUSB` are how the browser and Windows APIs spell themselves; wrapping
+# every prose mention in backticks would read worse than the words do.
+doc-valid-idents = ["SoC", "XBurst", "XBurst1", "XBurst2", "OpenIPC", "WebUSB", "WinUSB", ".."]
+
+# Two proc-macro parser versions in the graph: `thiserror-impl` moved to syn 3 while
+# `wasm-bindgen-macro-support` is still on syn 2. Both are build-time only and neither
+# reaches a shipped artifact. Pinning thiserror back to 2.0.18 to silence this would
+# freeze a dependency for a cosmetic reason.
+#
+# `windows-sys`: `nusb` depends on 0.61 directly and on 0.52 through `rustix`/`errno`.
+# Windows-only; neither copy is compiled for Linux, macOS, wasm or Android. Same
+# reasoning, and the same entry, as deny.toml's `skip`.
+#
+# `thiserror`/`thiserror-impl`: `tdfu-jni`'s `jni` 0.21 (the Android drop-in, chosen for
+# its stable classic API so the app loads the `.so` unchanged) still depends on
+# `thiserror` 1 while the workspace is on `thiserror` 2. Permissively licensed and only
+# in the Android artifact's graph; the same entry as deny.toml's `skip`. This is
+# the central home for the allow, not a crate-level `#![allow]`.
+allowed-duplicate-crates = ["syn", "windows-sys", "thiserror", "thiserror-impl"]
