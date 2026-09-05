@@ -1,0 +1,35 @@
+# Fuzzing lives outside the workspace because `libfuzzer-sys` needs a nightly toolchain
+# and `-Z` flags, and pulling that into the workspace would force every ordinary
+# `cargo build` through it. The root manifest excludes this directory; nothing else in
+# the tree depends on it.
+#
+#   cargo +nightly fuzz run wire -- -max_total_time=60
+
+# Its own workspace root as well as excluded above: `cargo` looks *upwards* for a
+# manifest, and a checkout that lives under another one - a secondary working tree
+# inside the repo, a vendored copy - would otherwise be claimed by whatever it finds
+# there. The exclude covers the ordinary clone; this covers the rest.
+[workspace]
+
+[package]
+name = "tdfu-proto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tdfu-proto = { path = "../crates/tdfu-proto" }
+
+[[bin]]
+name = "wire"
+path = "fuzz_targets/wire.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = true

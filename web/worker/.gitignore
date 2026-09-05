@@ -1,0 +1,4 @@
+# Local wrangler state: account cache, and the miniflare cache (which holds whole
+# firmware images after a `wrangler dev` run).
+.wrangler/
+node_modules/

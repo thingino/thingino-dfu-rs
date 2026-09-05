@@ -1,0 +1,74 @@
+[package]
+name = "tdfu-daemon"
+description = "dfu-remote: serve thingino-dfu operations over TCP, WebSocket and HTTP from one port"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+# The name the shipped daemon has always had.
+name = "dfu-remote"
+path = "src/main.rs"
+
+[lib]
+name = "tdfu_daemon"
+path = "src/lib.rs"
+
+[dependencies]
+tdfu-core.workspace = true
+tdfu-proto.workspace = true
+# The daemon enumerates the bus itself and maps `UsbErrorKind` onto the
+# wire error classes, so it names the transport seam directly rather than
+# through `tdfu-core`'s re-exports.
+tdfu-usb.workspace = true
+thiserror.workspace = true
+
+# The async runtime. `cargo deny`'s `multiple-versions = "deny"` makes every crate a
+# standing liability, so the feature set is chosen one at a time:
+#
+#   net      - `TcpListener`/`TcpStream`. The whole point.
+#   io-util  - `AsyncReadExt`/`AsyncWriteExt`. Without it there is no `read`/`write_all`.
+#   time     - `tokio::time::timeout`. This is the one that carries every deadline:
+#              the C daemon has no read or idle timeout anywhere (verified: no
+#              `SO_RCVTIMEO`, `poll`, `select` or `alarm` in `dfu-remote/`), so one
+#              connection that sends nothing wedges every other client.
+#   rt       - the current-thread runtime `main.rs` drives (decision D1: core is
+#              `?Send`, the daemon is single-client).
+#   signal   - `main.rs` ends the accept loop on SIGINT/SIGTERM as the C's
+#              `signal_handler` does (`dfu-remote/main.c:89`), and dropping the
+#              connection in flight is what removes a half-written READ staging file.
+#   macros   - `select!` between the accept loop and those signals, and
+#              `#[tokio::test]`.
+#
+# Deliberately OFF: `rt-multi-thread` (D1 says single-threaded), `fs`, `process`,
+# `sync`, `bytes`.
+tokio = { version = "1", default-features = false, features = ["net", "io-util", "time", "rt", "signal", "macros"] }
+# `IPV6_V6ONLY` cleared on the listening socket, as `dfu-remote/main.c:1069-1100` does,
+# so one socket serves both families; tokio has no setter for it. Already in the graph
+# through tokio, at this version.
+socket2 = "0.6"
+
+# Auth rejections are logged here and nowhere else can be trusted to remember
+# (an earlier implementation logged them nowhere, not even under
+# `--debug`, so token brute-forcing over the browser transport left no trace). Same
+# version and feature set as `tdfu-cli`'s, so no second copy enters the graph.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+# The same subscriber `tdfu-cli` installs, with the same levels, so `-d` reads the same
+# on both binaries.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+
+[dev-dependencies]
+# `FakeGadget` and `MockTransport`: the whole command surface is tested against the
+# U-Boot gadget emulator, with no hardware.
+tdfu-usb = { workspace = true, features = ["mock"] }
+# `oneshot`, so the accept-loop tests can say "shut down now" from the client's side.
+# Test-only: the binary's shutdown is a signal, and `sync` stays off the shipped graph.
+tokio = { version = "1", default-features = false, features = ["sync"] }
+
+[lints]
+workspace = true

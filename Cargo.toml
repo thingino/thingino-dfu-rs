@@ -1,0 +1,98 @@
+[workspace]
+resolver = "2"
+# `xtask` is the deliberate exception and the only code carried over from an earlier
+# implementation: it is the loader fetcher and the packager, it has no C counterpart
+# to have been contaminated by, it was audited, and its four bugs are fixed. Rebuilding
+# tooling that already drives real hardware would be waste, not hygiene.
+members = [
+    "crates/tdfu-usb",
+    "crates/tdfu-core",
+    "crates/tdfu-proto",
+    "crates/tdfu-cli",
+    "crates/tdfu-daemon",
+    "crates/tdfu-wasm",
+    "crates/tdfu-jni",
+    "xtask",
+]
+# `fuzz/` is a cargo-fuzz crate: it needs a nightly toolchain and `-Z` flags, which would
+# otherwise be forced on every ordinary `cargo build` in the workspace. Excluded, not a
+# member, exactly as `cargo fuzz init` intends.
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "2.0.0-alpha.1"       # AGENTS.md D6; bumping it is docs/release.md step 1
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-2.0-or-later"
+# The rewrite merges into the C tool's repository at parity.
+repository = "https://github.com/thingino/thingino-dfu-rs"
+readme = "README.md"            # clippy::cargo_common_metadata wants one per package
+keywords = ["usb", "dfu", "ingenic", "firmware", "flashing"]
+categories = ["command-line-utilities", "embedded", "hardware-support"]
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+# A lint group next to individual lints needs an explicit lower priority, or
+# cargo refuses to build (clippy::lint_groups_priority). Level unchanged.
+rust_2018_idioms = { level = "warn", priority = -1 }
+missing_docs = "warn"              # "deny" on tdfu-core and tdfu-proto once they stabilise
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+unwrap_used = "deny"               # no crate opts back in; an exception needs a reason= on the spot
+expect_used = "deny"
+panic = "deny"
+module_name_repetitions = "allow"  # the curated allow-list lives HERE, never inline
+
+[workspace.dependencies]
+tdfu-core = { path = "crates/tdfu-core", version = "2.0.0-alpha.1" }
+tdfu-proto = { path = "crates/tdfu-proto", version = "2.0.0-alpha.1" }
+tdfu-usb = { path = "crates/tdfu-usb", version = "2.0.0-alpha.1" }
+thiserror = { version = "2", default-features = false, features = ["std"] }
+
+# The Android JNI bridge. The classic, stable jni 0.21 API - `JNIEnv`, `GlobalRef`,
+# `call_method(obj, "onLog", "(Ljava/lang/String;)V", &[..])` with plain string names and
+# signatures - is chosen over the 0.22 redesign (`Env`, `Global`, the `jni_str!`/`jni_sig!`
+# macros) on purpose: `thingino-app` must load the `.so` unchanged, so the load-bearing FFI
+# stays on well-trodden ground. Only `tdfu-jni` depends on it. The cost is a transitive
+# `thiserror` 1 (jni 0.21 has not moved to 2) and `jni-sys` held at 0.3.0 in the lockfile to
+# keep a single version; both are recorded in `deny.toml`.
+jni = "0.21.1"
+
+# The browser engine. **Exact** requirements, not caret floors: `js-sys`,
+# `web-sys`, `wasm-bindgen-futures` and `wasm-bindgen-test` all speak `wasm-bindgen`'s
+# ABI and a mismatched pair fails at link time with an unhelpful message, and the
+# `wasm-bindgen` CLI has to be the same version as the crate or it refuses outright
+# ("the `wasm-bindgen` Rust dependency and the `wasm-bindgen` CLI do not match"), which
+# is what `cargo xtask web` and the CI wasm leg both read out of `Cargo.lock`. The
+# comment here used to say "pinned" over four caret floors that had already resolved
+# five versions higher: only `Cargo.lock` pinned anything, and
+# nothing outside CI passes `--locked`. Moving one of these is now a deliberate edit.
+wasm-bindgen = "=0.2.127"
+wasm-bindgen-futures = "=0.4.77"
+js-sys = "=0.3.104"
+wasm-bindgen-test = "=0.3.77"
+# Only the interfaces the WebUSB backend actually calls. One per line with what uses it,
+# because `web-sys` compiles what it is asked for and nothing else, and an unexplained
+# feature is one nobody dares delete. `Navigator` was here and is gone: `navigator.usb`
+# is read off the global with `js_sys::Reflect` (which is what makes the crate work under
+# Node), `web_sys::Navigator` is named nowhere, and building without it is byte-identical
+# after bindgen.
+web-sys = { version = "=0.3.104", features = [
+    "Usb",                          # getDevices(), requestDevice()
+    "UsbDevice",                    # open/close, select*, claim/release, transfers, reset
+    "UsbDeviceFilter",              # the VID:PID pairs requestDevice() asks permission for
+    "UsbDeviceRequestOptions",      # requestDevice({ filters })
+    "UsbConfiguration",             # the parsed descriptor tree the browser exposes instead
+    "UsbInterface",                 #   of a readable configuration descriptor
+    "UsbAlternateInterface",        #   -- class/subclass/alt number AND interfaceName
+    "UsbControlTransferParameters", # the setup packet, with typed requestType/recipient
+    "UsbRequestType",               # ControlType -> "standard" | "class" | "vendor"
+    "UsbRecipient",                 # Recipient -> "device" | "interface" | "endpoint" | "other"
+    "UsbDirection",                 # clearHalt("in"|"out", n) -- ROM's latched halt
+    "UsbInTransferResult",          # gates controlTransferIn / transferIn; the result's own
+    "UsbOutTransferResult",         #   fields are read reflectively, see usb::transport::status_of
+    "DomException",                 # the name of a rejection: NotFoundError, SecurityError, ...
+] }

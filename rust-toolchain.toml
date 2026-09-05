@@ -1,0 +1,6 @@
+# The version CI and every agent builds with. The MSRV is separate and lives in
+# the workspace manifest (`rust-version`); CI checks it in its own job.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -1,0 +1,19 @@
+# T32LQ U-Boot DFU gadget, sysfs /descriptors (device descriptor + full configuration descriptor), captured 2026-08-22.
+# Loader: firmware/dfu/t32lq from the v1.5.41 release (gtxaspec/u-boot usbboot 693a55774bb). Byte-exact descriptor fixture.
+# device(18): 1201 0002 00 00 00 40 a108 09c3 a77e 01 02 03 01
+# config(45=0x2d): 09 02 2d00 01 01 02 c0 01 | iface0 alt0 fe/01/02 i5 flash | alt1 i6 erase | alt2 i7 reboot | 09 21 0f 0000 0010 1001 = bmAttributes 0x0f, wDetachTimeOut 0, wTransferSize 0x1000=4096, bcdDFU 0x0110
+120100020000004008a109c3a77e0102030109022d00010102c0010904000000fe0102050904000100fe0102060904000200fe01020709210f000000101001
+--- wTransferSize / bcdDFU per lsusb ---
+    wTotalLength       0x002d
+    bConfigurationValue     1
+      bInterfaceNumber        0
+      bAlternateSetting       0
+      iInterface              5 flash
+      bInterfaceNumber        0
+      bAlternateSetting       1
+      iInterface              6 erase
+      bInterfaceNumber        0
+      bAlternateSetting       2
+      iInterface              7 reboot
+        wTransferSize                    4096 bytes
+        bcdDFUVersion                   1.10

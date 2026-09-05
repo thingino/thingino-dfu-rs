@@ -1,0 +1,69 @@
+[package]
+name = "tdfu-cli"
+description = "thingino-dfu: flash Ingenic XBurst cameras over USB from the command line"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+# The name users type, and the name the release artifacts carry.
+name = "thingino-dfu"
+path = "src/main.rs"
+
+[lib]
+name = "tdfu_cli"
+path = "src/lib.rs"
+
+[dependencies]
+tdfu-core.workspace = true
+# `SO_KEEPALIVE` and its three knobs on the `--host` socket: `std::net::TcpStream` has no
+# setter for any of them, and without them a daemon host that vanishes with no RST leaves
+# the tool blocked in `read` for ever, which an audit found. Already in the graph through
+# tokio at this version, and `all` is what unlocks `TCP_KEEPCNT`; the feature adds no
+# dependencies of its own (`socket2`'s `all = []`), only API.
+socket2 = { version = "0.6", features = ["all"] }
+# For `DEFAULT_PORT` alone today. `--port`'s default and the daemon's listening port
+# must be one number, and the `--host` client is this crate's own code, so the
+# alternative was a second literal `5050` that nothing keeps in step.
+tdfu-proto.workspace = true
+tdfu-usb.workspace = true
+thiserror.workspace = true
+
+# Feature set chosen one at a time; every entry is justified because `cargo deny`'s
+# `multiple-versions = "deny"` makes each added crate a standing liability.
+#
+#   std            - not optional, clap does not build without it.
+#   derive         - the parser is a type, so the plan is a value and can be unit-tested
+#                    with no bus and no process.
+#   help           - `-h`/`--help`. The C has both (`cli/main.c:90-92`) and functional
+#                    parity keeps them.
+#   usage          - the `Usage:` line under an error. No extra crate.
+#   error-context  - names the offending argument instead of "invalid value". Not
+#                    discarding what is in hand, applied to our own front door: the
+#                    information is there, so print it. No extra crate.
+#
+# Deliberately OFF: `color` (pulls anstream/colorchoice/is_terminal_polyfill and
+# windows-sys, into a `multiple-versions = "deny"` graph), `wrap_help` (terminal_size ->
+# rustix/windows-sys), `suggestions` (strsim, a crate for a nicety), `unicode`, `env`,
+# `cargo`, `string`, `deprecated`.
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+
+# The diagnostics behind `-d`/`--debug`. The shape is settled already: the
+# level prefix is the information, and it is the seam the daemon and the rest of the
+# flag surface will log through. `attributes` is off - nothing here wants
+# `#[instrument]`.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+# `fmt` only: no `ansi` (colour), no `env-filter` (regex + matchers), no `json`.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+
+[dev-dependencies]
+# The scripted double the in-crate fake backend is built on.
+tdfu-usb = { workspace = true, features = ["mock"] }
+
+[lints]
+workspace = true

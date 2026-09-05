@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# Local gate, run before anything leaves this machine.
+#
+# Two jobs. The first is the cheap one: the same fmt/clippy/test gate CI runs, so a
+# failure costs 30 s here instead of a round trip through CI. The second is the one that
+# actually matters: **this repository is public**, so a lab address or a home path is not
+# a future leak to clean up before cutover - it is a live one the moment it is pushed.
+#
+# The leak scan covers BOTH the working tree and every commit being pushed. Scanning only
+# the tree was the hook's original bug: add a lab address in commit A, scrub it in commit
+# B, and the tip is clean while the address is in the public history for ever. Git hands
+# us the ref range on stdin; use it.
+#
+# Skip deliberately with TDFU_SKIP_HOOK=1 (e.g. pushing a WIP branch for CI to chew on).
+set -uo pipefail
+
+if [ "${TDFU_SKIP_HOOK:-0}" = "1" ]; then
+    echo "pre-push: skipped (TDFU_SKIP_HOOK=1)"
+    exit 0
+fi
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root" || exit 1
+fail=0
+
+# The lab identifiers that must never reach a public repo. The IP form is a full dotted
+# quad so that writing "10.25.x" in prose does not trip it.
+pattern='10\.25\.[0-9]{1,3}\.[0-9]{1,3}|opi-closet|/home/turismo'  # leak-scan-ok
+zero='0000000000000000000000000000000000000000'
+
+# `leak-scan-ok` lets prose quote a banned pattern. It is honoured ONLY in Markdown and in
+# this hook - never in code or config, where it would be a way to smuggle a real address
+# past the scan rather than to document one.
+exempt() { grep -vE '^[^:]*\.(md):[0-9]+:.*leak-scan-ok|^\.githooks/pre-push:[0-9]+:'; }
+
+# 1a. The working tree, for immediate feedback while editing.
+leaks=$(git grep -nIE "$pattern" -- . ':!Cargo.lock' | exempt || true)
+if [ -n "$leaks" ]; then
+    echo "pre-push: REFUSING - lab data in tracked files:" >&2
+    echo "$leaks" >&2
+    fail=1
+fi
+
+# 1b. Every commit actually being pushed. Git writes one
+# "<local ref> <local sha> <remote ref> <remote sha>" line per ref to our stdin.
+if [ ! -t 0 ]; then
+    while read -r _local_ref local_sha _remote_ref remote_sha; do
+        [ -z "${local_sha:-}" ] && continue
+        [ "$local_sha" = "$zero" ] && continue          # a branch deletion pushes nothing
+        if [ "${remote_sha:-$zero}" = "$zero" ]; then
+            # New branch: everything on it that no other remote ref already has.
+            range="$local_sha --not --remotes=origin"
+        else
+            range="$remote_sha..$local_sha"
+        fi
+        # -p over the range shows every line ever ADDED by these commits, so an address
+        # added and later scrubbed is still caught - which is the whole point.
+        #
+        # `leak-scan-ok` is honoured here on exactly the terms scan 1a honours it: only in
+        # Markdown, only in this hook. A diff line carries no path of its own, so awk
+        # carries the file down from each `+++ b/<path>` header and prefixes each added
+        # line with it, in the `path:n:line` shape `exempt` reads. Without that, a marker
+        # on a `.toml` or `.rs` line added in one commit and scrubbed in the next waives
+        # the address out of the scan and it stays in the public history for ever. `n`
+        # counts added lines within that file's diff: a walk over many commits has no one
+        # file to number against, and it is there only to tell two hits apart.
+        # shellcheck disable=SC2086
+        hist=$(git log -p --no-color --no-merges $range -- . ':!Cargo.lock' 2>/dev/null \
+               | awk '
+                   /^\+\+\+ b\// { path = substr($0, 7); n = 0; next }
+                   /^\+\+\+ / { path = ""; next }
+                   /^\+/ { n = n + 1; if (path != "") print path ":" n ":" $0 }
+                 ' \
+               | grep -E "^[^:]*:[0-9]+:\+.*($pattern)" | exempt || true)
+        if [ -n "$hist" ]; then
+            echo "pre-push: REFUSING - lab data inside the commits being pushed:" >&2
+            echo "$hist" | head -20 >&2
+            echo "  (the tip may be clean; history is what leaks. Rewrite the commits.)" >&2
+            fail=1
+        fi
+    done
+fi
+
+[ "$fail" -eq 0 ] || echo "  lab addresses and hostnames belong in untracked files; scrub before committing." >&2
+
+# The leak scan alone, which is what `.githooks/test-pre-push` drives: it pins the scan
+# without a cargo build. This skips only part 2 below - the scan has already run above and
+# its refusal still stands, so it can waive nothing.
+if [ "${TDFU_HOOK_SCAN_ONLY:-0}" = "1" ]; then
+    exit "$fail"
+fi
+
+# 2. The CI gate, in CI's order so the first failure here is the first failure there.
+for step in "cargo fmt --all --check" \
+            "cargo clippy --locked --workspace --all-targets --all-features -- -D warnings" \
+            "cargo test --locked --workspace --all-features"; do
+    printf 'pre-push: %s ... ' "${step%% --*}"
+    if out=$($step 2>&1); then
+        echo ok
+    else
+        echo FAILED
+        echo "$out" | tail -30 >&2
+        fail=1
+        break
+    fi
+done
+
+# 2b. The wasm target's own clippy: the host gate compiles the
+# wasm-only files away, so `tdfu-wasm`'s largest module and its Node tests are linted only
+# on the target. Skipped with a line on a checkout without the target; CI always runs it.
+if [ "$fail" -eq 0 ]; then
+    if rustup target list --installed 2>/dev/null | grep -qx 'wasm32-unknown-unknown'; then
+        printf 'pre-push: cargo clippy (wasm32-unknown-unknown) ... '
+        if out=$(cargo clippy --locked --target wasm32-unknown-unknown -p tdfu-wasm --all-targets --all-features -- -D warnings 2>&1); then
+            echo ok
+        else
+            echo FAILED
+            echo "$out" | tail -30 >&2
+            fail=1
+        fi
+    else
+        echo "pre-push: wasm32-unknown-unknown is not installed here; the wasm clippy step runs in CI"
+    fi
+fi
+
+[ "$fail" -eq 0 ] || echo "pre-push: blocked. Fix, or push with TDFU_SKIP_HOOK=1 if deliberate." >&2
+exit "$fail"
