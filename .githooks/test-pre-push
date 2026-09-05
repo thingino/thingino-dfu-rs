@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# The leak scan of `pre-push`, driven end to end in a throwaway repository.
+#
+# The case that matters is the one the history half exists for: a lab address added in one
+# commit and scrubbed in the next is clean at the tip and still in the history being
+# pushed. A `leak-scan-ok` marker must not waive that from a line of code - only from
+# Markdown, which is the one place prose has to quote an address.
+#
+# `TDFU_HOOK_SCAN_ONLY=1` runs the scan without the cargo gate, so this costs a second.
+# Run it after touching the scan: `.githooks/test-pre-push`.
+set -uo pipefail
+
+hook="$(cd "$(dirname "$0")" && pwd)/pre-push"
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+failures=0
+
+# The banned address, assembled rather than written out: a literal dotted quad in this file
+# would be a hit in the very scan this file tests.
+third=90
+fourth=10
+addr="10.25.${third}.${fourth}"
+
+# One case: commit `line` into `file`, optionally scrub it in a second commit, then run the
+# hook over the range a push of those commits would hand it. `want` is the exit code the
+# hook must produce.
+run_case() {
+    local name="$1" file="$2" line="$3" scrub="$4" want="$5"
+    local repo="$work/repo" base tip out got
+
+    rm -rf "$repo"
+    git init -q "$repo"
+    git -C "$repo" config user.email tester@example.invalid
+    git -C "$repo" config user.name tester
+    git -C "$repo" config commit.gpgsign false
+
+    echo base > "$repo/README.md"
+    git -C "$repo" add README.md
+    git -C "$repo" commit -qm base
+    base=$(git -C "$repo" rev-parse HEAD)
+
+    mkdir -p "$(dirname "$repo/$file")"
+    printf '%s\n' "$line" > "$repo/$file"
+    git -C "$repo" add "$file"
+    git -C "$repo" commit -qm add
+    if [ "$scrub" = scrub ]; then
+        git -C "$repo" rm -q "$file"
+        git -C "$repo" commit -qm scrub
+    fi
+    tip=$(git -C "$repo" rev-parse HEAD)
+
+    # Git writes one "<local ref> <local sha> <remote ref> <remote sha>" line per ref to a
+    # pre-push hook's stdin; the remote sha is the base commit, so the range is the two
+    # commits above.
+    out=$(cd "$repo" && TDFU_HOOK_SCAN_ONLY=1 "$hook" <<EOF 2>&1
+refs/heads/main $tip refs/heads/main $base
+EOF
+    )
+    got=$?
+    if [ "$got" = "$want" ]; then
+        echo "ok    $name"
+    else
+        echo "FAIL  $name: expected exit $want, got $got"
+        echo "$out" | sed 's/^/        /'
+        failures=$((failures + 1))
+    fi
+}
+
+# The evasion the marker rule is written against: code, marked, added and scrubbed.
+run_case "code marked and scrubbed is still a leak" \
+    "src/lab.rs" "const HOST: &str = \"${addr}\"; // leak-scan-ok" scrub 1
+
+# Prose quoting an address is what the marker is for, in history as in the tree.
+run_case "markdown marked and scrubbed is waived" \
+    "docs/bench.md" "The bench answers at ${addr}. <!-- leak-scan-ok -->" scrub 0
+
+# Markdown without the marker is not waived: the marker is per line, not per file type.
+run_case "markdown without the marker is a leak" \
+    "docs/bench.md" "The bench answers at ${addr}." scrub 1
+
+# The tree half, on the same terms: a marker in code does not waive the tip either.
+run_case "code marked and kept is a leak" \
+    "src/lab.rs" "const HOST: &str = \"${addr}\"; // leak-scan-ok" keep 1
+
+if [ "$failures" -eq 0 ]; then
+    echo "pre-push leak scan: all cases pass"
+else
+    echo "pre-push leak scan: $failures case(s) failed" >&2
+fi
+exit "$((failures > 0))"

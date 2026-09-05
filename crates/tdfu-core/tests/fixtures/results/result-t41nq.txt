@@ -1,0 +1,16 @@
+# transcribed from the 2026-08-22 session log (run predates result capture to file)
+device: a108:c309 "USB Boot Device"
+magic:  "T31V"
+
+[1] registers via kseg1 (0xB3......), the address form --diag uses:
+  soc_id       @0xB300002C = 0x10040003
+  subsoctype1  @0xB3540238 = 0x00000000
+  subsoctype2  @0xB3540250 = 0xAAAA2222
+
+  cpu_id=0x0040  sub1=0x0000  sub2=0xAAAA
+  => T41NQ   (loader dir: t41nq)
+
+  window[+0x38] = 0x00000000  == subsoctype1 (match)
+  window[+0x50] = 0xAAAA2222  == subsoctype2 (match)
+
+[3] --try-phys (separate run): soc_id(phys) @0x1300002C : FAILED (LIBUSB_ERROR_TIMEOUT); every request after it timed out until power-cycle

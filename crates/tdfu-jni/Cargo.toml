@@ -1,0 +1,36 @@
+[package]
+name = "tdfu-jni"
+description = "thingino-dfu for Android: JNI bindings over tdfu-core, driving a device opened from a Java file descriptor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+# `cdylib` is what the app loads; `rlib` keeps `cargo test` able to run unit tests on
+# the host.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+tdfu-core.workspace = true
+# `tdfu-proto` is here for one reason: `nativeVariantToString` maps a `tdfu_variant_t`
+# wire ordinal (the 59-entry table the dfu-remote daemon sends) to a name, which is
+# `WireVariant`, not `tdfu-core`'s 34-entry loader `Variant`.
+tdfu-proto.workspace = true
+tdfu-usb.workspace = true
+jni.workspace = true
+
+[dev-dependencies]
+# The in-process `JavaVM` the JNI-surface tests launch (JDK 21). Additive over the base
+# crate, so the release `.so` build never pulls `java-locator`/`libloading`.
+jni = { workspace = true, features = ["invocation"] }
+# The scripted transport, so the op-driver and detect paths run on the host against a
+# fake device where a real Ingenic fd is not available.
+tdfu-usb = { workspace = true, features = ["mock"] }
+
+[lints]
+workspace = true

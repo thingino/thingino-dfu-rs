@@ -1,0 +1,36 @@
+[package]
+name = "tdfu-usb"
+description = "USB transport seam for thingino-dfu: the trait every backend implements, plus a scripted mock"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+# The scripted `MockTransport` is compiled for this crate's own tests always, and for
+# downstream test crates when they turn this on.
+mock = []
+
+[dependencies]
+thiserror.workspace = true
+
+# The native backend (`src/native/`). Target-gated rather than feature-gated so that
+# `tdfu-wasm` - the one crate that must NOT pull it - cannot acquire it by enabling
+# `--all-features`, and so that `cargo deny`'s wasm32 graph stays free of it. Android is
+# deliberately inside the gate: `nusb::Device::from_fd` is how Java hands a device over
+# even though `nusb::list_devices` does not exist on that target.
+#
+# Pinned exactly. A spike validated 0.2.7 against real bootroms, and
+# this crate depends on behaviour finer than semver tracks: an IN request must be a
+# multiple of the endpoint's max packet size, awaiting a `Blocking` MaybeFuture panics
+# without the `smol`/`tokio` feature, and `transfer_blocking`'s post-cancel wait is
+# unbounded. Bumping it is a reviewed change, not a lockfile refresh.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+nusb = "=0.2.7"
+
+[lints]
+workspace = true
