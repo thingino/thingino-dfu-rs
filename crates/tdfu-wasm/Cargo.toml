@@ -1,0 +1,39 @@
+[package]
+name = "tdfu-wasm"
+description = "thingino-dfu in the browser: the WebUSB backend and the wasm-bindgen surface the web flasher calls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+# `cdylib` is what wasm-bindgen consumes; `rlib` keeps `cargo test` able to run the
+# crate's own unit tests on the host.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+tdfu-core.workspace = true
+tdfu-proto.workspace = true
+tdfu-usb.workspace = true
+
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+js-sys.workspace = true
+web-sys.workspace = true
+
+[dev-dependencies]
+# The scripted double and the U-Boot gadget emulator: the clock-seam pin drives a real
+# write and a real verify through the JS timer against `FakeGadget`.
+tdfu-usb = { workspace = true, features = ["mock"] }
+# NOTE: this pulls `async-trait` transitively, as a proc macro of its own harness. The
+# rule against the `async_trait` crate is about our traits - it would box every future and
+# require `Send`, which is the opposite of the `?Send` the browser needs - and nothing here
+# uses it. It is a dev-dependency and reaches no shipped artifact.
+wasm-bindgen-test.workspace = true
+
+[lints]
+workspace = true

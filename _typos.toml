@@ -1,0 +1,33 @@
+# Spell-check configuration for `typos`.
+#
+# Only genuine project vocabulary belongs here. Anything added must be a word this
+# codebase really uses, not a typo someone did not want to fix.
+
+[default.extend-words]
+# The `mis-` prefix in hyphenated prose ("mis-bounds", "mis-encoded"); typos splits on
+# the hyphen and sees a word.
+mis = "mis"
+# The constant-time token comparison in tdfu-daemon's `auth.rs` tests `ba` against the
+# secret `ab`: a transposition is the input that separates a folding `|` from an `^`.
+ba = "ba"
+# The `flate2` crate (xtask's tarball and zip writer). typos splits the identifier on the
+# digit and reads `flate`; it does not flag it in `.rs` code but does in prose that names
+# the crate. `flate` is the token to allow, not a misspelling of `flat`.
+flate = "flate"
+
+[files]
+# Vendored or generated: not ours to correct.
+#
+# The web flasher's translated dictionaries are not English and an English spell
+# checker reads them as 200-odd errors ("ist" for "is", "alle" for "all", "oder" for
+# "order"). `i18n-dfu-en.js` is deliberately NOT excluded - that one is English and is
+# the file where a real typo would ship. The three vendored injectors under
+# `public/wasm/` are Emscripten output, rebuilt only in the C repository.
+extend-exclude = [
+    "Cargo.lock",
+    "crates/tdfu-core/tests/fixtures/results/",
+    "web/public/i18n-dfu-*.js",
+    "!web/public/i18n-dfu-en.js",
+    "web/public/wasm/*.mjs",
+    "web/package-lock.json",
+]

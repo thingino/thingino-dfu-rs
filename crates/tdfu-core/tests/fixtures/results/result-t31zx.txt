@@ -1,0 +1,18 @@
+device: a108:c309 (bootrom), a T31ZX camera on a phone's USB OTG
+magic:  not captured (the Android app reads the three registers only; no --diag)
+
+[1] registers via kseg1 (0xB3......), the address form --diag uses:
+  soc_id       @0xB300002C = 0x10031003
+  subsoctype1  @0xB3540238 = 0x66661111
+  subsoctype2  @0xB3540250 = 0x00000000
+
+  cpu_id=0x0031  sub1=0x6666  sub2=0x0000
+  => T31ZX  (loader dir: t31x)
+
+source: the Android app run of 2026-09-03, read from the app's own
+log with the core's debug narration on:
+  identified: chip=T31ZX grade=0x6666 evidence=Vendor loader=t31x regs=SocRegs { soc_id: 268636163, subsoctype1: 1717965073, subsoctype2: 0, t33_selector: None }
+The same unit was detected as T31ZX and flashed from the t31x loader over WebUSB earlier
+the same day, without a register capture. Through the app it bootstrapped from the t31x
+loader (tpl.bin + uboot.bin), read 32 MiB (SHA-256 909a3b86...) and wrote with verify;
+the eFuse window was not read on this run.

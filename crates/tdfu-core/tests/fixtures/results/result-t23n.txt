@@ -1,0 +1,14 @@
+# transcribed from the 2026-08-22 session log (run predates result capture to file)
+device: a108:c309 "USB Boot Device"
+magic:  "T31V"
+
+[1] registers via kseg1 (0xB3......), the address form --diag uses:
+  soc_id       @0xB300002C = 0x10023003
+  subsoctype1  @0xB3540238 = 0x11111111
+  subsoctype2  @0xB3540250 = 0x00000000
+
+  cpu_id=0x0023  sub1=0x1111  sub2=0x0000
+  => T23N   (loader dir: t23n)
+
+  window[+0x38] = 0x11111111  == subsoctype1 (match)
+  window[+0x50] = 0x00000000  == subsoctype2 (match)

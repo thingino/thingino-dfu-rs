@@ -1,0 +1,24 @@
+/target/
+# `cargo xtask package` stages the release archives here, and the release workflow
+# uploads them from here. Build products, never committed.
+/dist/
+# A lab's relay map, if one is ever kept beside the tree. Never committed.
+/bench.toml
+/spikes/*/target/
+**/*.orig
+
+# cargo-mutants working directories
+/mutants.out/
+/mutants.out.old/
+
+# The web flasher's build products. `cargo xtask web` writes all three:
+# src/wasm/ is wasm-bindgen's generated glue, dist/ is vite's bundle, and
+# public/firmware is the link to the loader tree `cargo xtask fetch-loaders`
+# unpacks under target/. node_modules/ comes from `npm ci`.
+/web/src/wasm/
+/web/dist/
+/web/node_modules/
+/web/public/firmware
+
+# Agent worktrees: untracked tooling that would otherwise mark every local package -dirty
+.claude/worktrees/

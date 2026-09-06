@@ -1,0 +1,439 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # The release workflow calls this file before it builds anything, so a tag gets the same
+  # gate a push to main gets, from one copy of the rules rather than a second list that can
+  # drift away from this one.
+  workflow_call:
+
+permissions:
+  contents: read
+
+# The workflow name is in the group so a run called by the release workflow is not in the
+# same group as a direct CI run: a cancelled gate would fail the release that is waiting on
+# it.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Every tool the gate downloads and then executes is pinned to an exact release and to
+  # the sha256 of the archive that release held when the pin was written. A tag can be
+  # moved and an asset can be replaced; a checksum recorded here cannot be, so a swapped
+  # binary fails the step instead of running on a runner that holds a workflow token.
+  # Bumping a version means recording its checksum in the same commit:
+  #   gh api repos/<owner>/<repo>/releases/tags/<tag> \
+  #     --jq '.assets[] | select(.name|test("x86_64-unknown-linux-musl")) | [.name,.digest] | @tsv'
+  CARGO_DENY_VERSION: "0.20.2"
+  CARGO_DENY_SHA256: "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f"
+  TYPOS_VERSION: "v1.50.1"
+  TYPOS_SHA256: "edf0545109aee6a22751d04ddecb97c45be47d3aa0409564fb895eeeace91b1e"
+  MACHETE_VERSION: "v0.9.2"
+  MACHETE_SHA256: "48200087f54c55aabcd4db4af1e25742b49846c02a1b1bfa134711945b35b2e9"
+
+jobs:
+  # fmt / clippy / test / deny, plus the loader tree (AGENTS.md D2).
+  gate:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      # No actions anywhere in this file, third-party or first-party: plain git and the
+      # gh CLI do everything CI needs. The single exception is `upload-artifact` on the
+      # wasm leg, which has no gh equivalent (a workflow artifact needs the runtime token
+      # only the action carries) and is pinned by commit sha there.
+      - name: Check out
+        run: |
+          git init -q .
+          # The token goes on this one fetch and never into .git/config. A persisted
+          # remote leaves a credential in the workspace for everything that runs later in
+          # the job to read - a dependency's build script, a downloaded tool - and the
+          # release job's is a `contents: write` token. `actions/checkout` has
+          # `persist-credentials: false` for exactly this; a hand-rolled checkout has to
+          # do it by hand.
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c http.extraheader="AUTHORIZATION: basic $auth" \
+            fetch -q --depth 1 --no-tags "https://github.com/${GITHUB_REPOSITORY}" "$SHA"
+          git checkout -q FETCH_HEAD
+
+      # rust-toolchain.toml pins the version; rustup installs it on first use.
+      - name: Toolchain
+        run: rustc --version && cargo --version
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+      - name: Spell check
+        run: |
+          # Config is `_typos.toml`; every allowed word there carries a reason.
+          asset="typos-${TYPOS_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          gh release download "$TYPOS_VERSION" -R crate-ci/typos --pattern "$asset" --dir /tmp --clobber
+          ( cd /tmp && echo "$TYPOS_SHA256  $asset" | sha256sum -c - )
+          tar xzf "/tmp/$asset" -C /tmp ./typos
+          /tmp/typos
+
+      - name: Unused dependencies
+        run: |
+          # Every crate here uses what it declares, so there are no ignores at all right
+          # now; a crate that adds one declares it in its own manifest with the reason.
+          asset="cargo-machete-${MACHETE_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          gh release download "$MACHETE_VERSION" -R bnjbvr/cargo-machete --pattern "$asset" \
+            --dir /tmp --clobber
+          ( cd /tmp && echo "$MACHETE_SHA256  $asset" | sha256sum -c - )
+          tar xzf "/tmp/$asset" -C /tmp --strip-components 1
+          /tmp/cargo-machete --skip-target-dir
+
+      # Fetches the current loaders from the usbboot release of gtxaspec/u-boot and stamps
+      # the tree with the U-Boot commit they came from (AGENTS.md D2). The token keeps the
+      # release lookup off the unauthenticated API rate limit runners share.
+      #
+      # BEFORE the tests, not after: `variant_all_matches_the_pinned_loader_tree` checks
+      # the 34 `Variant` entries against the directories the release actually ships, and
+      # skips itself when the tree is absent. Run after the tests, that check would
+      # silently never run in CI.
+      - name: Fetch the loaders
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo xtask fetch-loaders
+
+      - name: Test
+        # TDFU_REQUIRE_LOADERS turns `variant_all_matches_the_pinned_loader_tree`'s
+        # self-skip into a failure. That test checks the 34 `Variant` entries against the
+        # directories the pinned release ships, and skips when the tree is absent - which
+        # at a terminal is indistinguishable from a pass. If the fetch step above were
+        # ever removed, reordered, or silently failed, the check would go on reporting
+        # `ok` forever. This makes "the loaders were there" an assertion.
+        run: TDFU_REQUIRE_LOADERS=1 cargo test --locked --workspace --all-features
+
+      # The fuzz target is excluded from the workspace (`libfuzzer-sys` wants nightly and
+      # `-Z` flags for an actual run, and pulling that in would drag every ordinary
+      # `cargo build` through it), so nothing automatic ever built it. A target that
+      # stopped compiling would sit in the tree looking committed and fuzz nothing.
+      #
+      # `cargo check`, not `cargo fuzz run`: this proves the target still builds against
+      # the current `tdfu-proto` API, which is the thing that rots. It needs no nightly -
+      # only an actual fuzzing *run* does - so it rides the pinned toolchain like every
+      # other step and costs seconds.
+      - name: Fuzz target builds
+        run: cargo check --manifest-path fuzz/Cargo.toml
+
+      - name: Install cargo-deny
+        run: |
+          asset="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          gh release download "$CARGO_DENY_VERSION" -R EmbarkStudios/cargo-deny \
+            --pattern "$asset" --dir /tmp --clobber
+          # Against the checksum in this file, not the `.sha256` beside the asset: whoever
+          # could replace the archive could replace that file too.
+          ( cd /tmp && echo "$CARGO_DENY_SHA256  $asset" | sha256sum -c - )
+          tar xzf "/tmp/$asset" -C /tmp --strip-components 1
+          install -m 0755 /tmp/cargo-deny "$HOME/.cargo/bin/cargo-deny"
+
+      - name: Dependency policy
+        run: cargo deny check
+
+  # The MSRV declared in the workspace manifest, checked against itself.
+  msrv:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Check out
+        run: |
+          git init -q .
+          # The token on the fetch, never in .git/config: see ci.yml's gate job.
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c http.extraheader="AUTHORIZATION: basic $auth" \
+            fetch -q --depth 1 --no-tags "https://github.com/${GITHUB_REPOSITORY}" "$SHA"
+          git checkout -q FETCH_HEAD
+
+      - name: Check on the declared MSRV
+        run: |
+          msrv=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+          test -n "$msrv" || { echo "no rust-version in Cargo.toml"; exit 1; }
+          echo "MSRV is $msrv"
+          rustup toolchain install "$msrv" --profile minimal
+          cargo "+$msrv" check --locked --workspace --all-targets --all-features
+
+  # The six shipping targets. Packaging is the release workflow's, not this one's.
+  #
+  # This job and the macOS one below were parked for a while and kept commented out rather
+  # than deleted, because their configuration encodes five CI failures that took real
+  # debugging, and every one of them is still live here:
+  #
+  #   1. A `matrix` context is illegal in a job-level `if`, which is why the macOS build
+  #      is its own job below and not a matrix leg.
+  #   2. The aarch64 leg needs `libc6-dev-arm64-cross` as well as `gcc-aarch64-linux-gnu`,
+  #      or the link fails on a missing `Scrt1.o`.
+  #   3. Every gate tool that is downloaded and then executed is pinned by version and by
+  #      a sha256 recorded in this file's `env`, never by the `.sha256` a release ships
+  #      beside its own asset - see the `Install cargo-deny` step above.
+  #   4. `nusb::list_devices` is desktop-only and must be cfg-gated for Android. That is
+  #      why the android leg exists at all: it is the leg that catches a backend which
+  #      compiles everywhere else. (No native backend is wired up yet, so today the leg
+  #      proves the pure-Rust crates cross-compile; it starts earning its keep the moment
+  #      `tdfu-usb` grows one.)
+  #   5. `collapsible_if` only surfaces under a full `--locked` workspace clippy, which is
+  #      why the gate job runs `--workspace --all-targets --all-features` rather than a
+  #      per-crate check.
+  build:
+    needs: gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runs-on: ubuntu-latest
+            targets: x86_64-unknown-linux-gnu
+            packages: -p tdfu-cli -p tdfu-daemon
+          - name: linux-aarch64
+            runs-on: ubuntu-latest
+            targets: aarch64-unknown-linux-gnu
+            apt: gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+            packages: -p tdfu-cli -p tdfu-daemon
+          - name: windows-x64
+            runs-on: ubuntu-latest
+            targets: x86_64-pc-windows-gnu
+            apt: gcc-mingw-w64-x86-64
+            packages: -p tdfu-cli -p tdfu-daemon
+          - name: wasm
+            runs-on: ubuntu-latest
+            targets: wasm32-unknown-unknown
+            packages: -p tdfu-wasm
+          # Both Android ABIs the app ships, so a break in either surfaces on every push.
+          # Renamed from `android-aarch64` now that it is no longer aarch64-only.
+          - name: android
+            runs-on: ubuntu-latest
+            targets: aarch64-linux-android armv7-linux-androideabi
+            packages: -p tdfu-jni
+            ndk: "yes"
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.runs-on }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Check out
+        run: |
+          git init -q .
+          # The token on the fetch, never in .git/config: see ci.yml's gate job.
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c http.extraheader="AUTHORIZATION: basic $auth" \
+            fetch -q --depth 1 --no-tags "https://github.com/${GITHUB_REPOSITORY}" "$SHA"
+          git checkout -q FETCH_HEAD
+
+      - name: Cross toolchain
+        if: matrix.apt != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ matrix.apt }}
+
+      - name: Rust targets
+        run: rustup target add ${{ matrix.targets }}
+
+      - name: Build
+        run: |
+          # The NDK's clang is the linker, one per ABI; its path is installation-specific, so
+          # it comes from the environment and never from .cargo/config.toml.
+          # The linker name is not the triple: armv7-linux-androideabi links with
+          # armv7a-linux-androideabi21-clang (note the `a` and the API level).
+          if [ -n "${{ matrix.ndk }}" ]; then
+            ndk="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+            bin="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+            export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$bin/aarch64-linux-android21-clang"
+            export CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER="$bin/armv7a-linux-androideabi21-clang"
+            test -x "$CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER"
+            test -x "$CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER"
+          fi
+          for target in ${{ matrix.targets }}; do
+            cargo build --locked --release --target "$target" ${{ matrix.packages }}
+          done
+
+      # Renaming the Kotlin package silently breaks statically registered JNI, so assert the
+      # full export set per ABI rather than trusting the build succeeded - the same check the
+      # packaging step runs at release time, from the same committed list
+      # (`--print-jni-symbols` prints what `check_jni_exports` requires). A count is not
+      # enough: rename one export and add another and the count is still right, while the
+      # app throws `UnsatisfiedLinkError` on its first flash. The C only counts
+      # (build-libtdfu-android.sh:79).
+      #
+      # The `.so` is filtered on `Java_` rather than on the full package prefix, so an
+      # export moved to another Kotlin package shows up as unexpected here rather than only
+      # as missing. `JNI_OnLoad` is in the list because it is what caches the `JavaVM`:
+      # without it every log line and progress update is silently dropped.
+      # The NDK's llvm-nm reads both the aarch64 and the armv7 ELF.
+      - name: JNI symbol parity
+        if: matrix.name == 'android'
+        run: |
+          ndk="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          nm="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          cargo xtask package --print-jni-symbols | sort > /tmp/jni-required
+          for target in ${{ matrix.targets }}; do
+            so="target/$target/release/libtdfu_jni.so"
+            "$nm" -D --defined-only "$so" | awk '{print $NF}' \
+              | grep -E '^(Java_|JNI_OnLoad$)' | sort -u > /tmp/jni-found
+            echo "$so:"
+            diff -u /tmp/jni-required /tmp/jni-found \
+              || { echo "the JNI symbols in $so are not the committed set"; exit 1; }
+          done
+
+      # `tdfu-wasm`'s browser half cannot be exercised by the gate job: the WebUSB
+      # transport, the `setTimeout` clock and the panic edge all need a JS runtime, so
+      # they are `wasm-bindgen-test`s under Node rather than host tests. `--target
+      # wasm32-unknown-unknown` selects them; the crate's host tests (the mapping tables,
+      # the option rules, the crate-level pins) already run in the gate.
+      #
+      # Those four test files all carry `#![cfg(target_family = "wasm")]`, so the gate job's
+      # clippy compiles them to nothing and 1 355 lines were unlinted until an audit
+      # found eight `-D warnings` errors in them. This is the same command
+      # the pre-push hook runs, on the target that can see
+      # them; it needs no toolchain beyond the target, so it goes before the download.
+      - name: wasm clippy
+        if: matrix.name == 'wasm'
+        run: cargo clippy --locked --target wasm32-unknown-unknown -p tdfu-wasm --all-targets --all-features -- -D warnings
+
+      # `wasm-bindgen` and `wasm-bindgen-test-runner` are two binaries of one tool and
+      # must both match the `wasm-bindgen` crate the workspace resolved to. A mismatch
+      # fails with "the `wasm-bindgen` Rust dependency and the `wasm-bindgen` CLI do not
+      # match", which is a confusing way to learn that a `cargo update` moved one of them.
+      #
+      # One download, both binaries. The leg used to `cargo install` the test runner from
+      # source (minutes) and then, two steps later, extract the pinned release tarball for
+      # the same version and install one binary out of it - and that tarball ships both
+      # (confirmed against the real 0.2.127 asset, which carries wasm-bindgen,
+      # wasm-bindgen-test-runner, wasm2es6js and the licences).
+      #
+      # The version comes from `cargo xtask web`, which is the same reader the build
+      # itself checks against, so there is no second copy of the rule here to drift or to
+      # answer differently when two majors are in the graph.
+      #
+      # `$HOME/.cargo/bin` on PATH was an unstated assumption of this leg:
+      # both binaries are resolved by name, one of them through a cargo runner env var.
+      # GITHUB_PATH applies to later steps, so this one exports it as well and then says
+      # out loud that both binaries resolve.
+      - name: wasm-bindgen CLI
+        if: matrix.name == 'wasm'
+        run: |
+          ver=$(cargo xtask web --print-wasm-bindgen-version)
+          test -n "$ver" || { echo "cargo xtask web could not resolve wasm-bindgen"; exit 1; }
+          echo "wasm-bindgen $ver"
+          asset="wasm-bindgen-${ver}-x86_64-unknown-linux-musl.tar.gz"
+          gh release download "$ver" -R wasm-bindgen/wasm-bindgen --pattern "$asset" --dir /tmp --clobber
+          tar xzf "/tmp/$asset" -C /tmp --strip-components 1
+          mkdir -p "$HOME/.cargo/bin"
+          install -m 0755 /tmp/wasm-bindgen "$HOME/.cargo/bin/wasm-bindgen"
+          install -m 0755 /tmp/wasm-bindgen-test-runner "$HOME/.cargo/bin/wasm-bindgen-test-runner"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          command -v wasm-bindgen
+          command -v wasm-bindgen-test-runner
+
+      - name: wasm tests (Node)
+        if: matrix.name == 'wasm'
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: cargo test --locked --target wasm32-unknown-unknown -p tdfu-wasm
+
+      # The page's own tests, which ran in no job at all before. They need
+      # no node_modules - only node builtins and web/src - and `npm test` forces the seam
+      # stub in front of them, which is what makes them work on a checkout that has
+      # already been built. `cargo xtask web` below wipes web/src/wasm and writes the real
+      # glue again, so the stub cannot reach the artifact.
+      - name: Web flasher tests (Node)
+        if: matrix.name == 'wasm'
+        run: npm --prefix web test
+
+      # The artifact has to be able to bootstrap a device, and that means the loader tree
+      # is in it: `cargo xtask web` links web/public/firmware/dfu at target/firmware/dfu
+      # only when one has been fetched, and this job is not the gate job that fetches it.
+      # Without this the shipped page 404s on
+      # firmware/dfu/<variant>/tpl.bin at every local bootstrap.
+      - name: Loader tree
+        if: matrix.name == 'wasm'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo xtask fetch-loaders
+
+      # The web flasher rides the wasm leg: it is the same engine, and a page that
+      # does not build against the bindings the engine actually exports is a broken
+      # flasher whichever half moved. `cargo xtask web` does all four steps, and it
+      # refuses a wasm-bindgen CLI that is not the version it resolved above.
+      #
+      # Node comes with the runner image; no setup-node, in keeping with this file's
+      # "no actions" rule. The pinned vite's own `engines` is
+      # `^18.0.0 || ^20.0.0 || >=22.0.0`, so 21 is outside it and a bare `-ge 20` let it
+      # through. 20, 22 or newer, named as such.
+      - name: Build the web flasher
+        if: matrix.name == 'wasm'
+        run: |
+          node --version
+          major=$(node -p 'process.versions.node.split(".")[0]')
+          if [ "$major" -lt 20 ] || [ "$major" -eq 21 ]; then
+            echo "vite wants node 20, 22 or newer; this is $major"
+            exit 1
+          fi
+          cargo xtask web --release
+
+      # The one action in this file. Uploading a workflow artifact has no `gh`
+      # equivalent - it needs the runtime token that only the action carries - so it is
+      # pinned by commit sha rather than by tag. The release workflow packages this dist.
+      - name: Upload web/dist
+        if: matrix.name == 'wasm'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: web-flasher
+          path: web/dist
+          if-no-files-found: error
+
+  # macOS runners bill 10x against the org's Free-plan Actions minutes, so the universal
+  # build used to run only on release tags and manual dispatch - not on every branch push
+  # or PR. (A job-level `if` may use the github context but NOT matrix, which is why this
+  # is its own job rather than a matrix leg. It stays a separate job for that reason even
+  # now that it runs unconditionally.)
+  #
+  # That gate existed while the repo was private, because macOS bills at 10x against a
+  # 2000 minute/month Free-plan budget. The repo is public as of 2026-08-22 and
+  # GitHub-hosted runners are free for public repositories, so the whole point of the gate
+  # is gone: run it on every push like every other target, and find a macOS-only break at
+  # the commit that caused it rather than at release time.
+  build-macos:
+    needs: gate
+    name: build (macos-universal)
+    runs-on: macos-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Check out
+        run: |
+          git init -q .
+          # The token on the fetch, never in .git/config: see ci.yml's gate job.
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c http.extraheader="AUTHORIZATION: basic $auth" \
+            fetch -q --depth 1 --no-tags "https://github.com/${GITHUB_REPOSITORY}" "$SHA"
+          git checkout -q FETCH_HEAD
+      - name: Rust targets
+        run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+      - name: Build
+        run: |
+          for target in x86_64-apple-darwin aarch64-apple-darwin; do
+            cargo build --locked --release --target "$target" -p tdfu-cli -p tdfu-daemon
+          done
+      - name: Make the universal binary
+        run: |
+          for bin in thingino-dfu dfu-remote; do
+            lipo -create -output "$bin" \
+              "target/x86_64-apple-darwin/release/$bin" \
+              "target/aarch64-apple-darwin/release/$bin"
+            file "$bin"
+          done

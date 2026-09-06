@@ -1,0 +1,23 @@
+[package]
+name = "tdfu-proto"
+description = "The thingino-dfu daemon wire protocol: 10-byte frames, eight commands, shared by client and server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+# Test-only. `default-features = false` drops the fork/timeout machinery (and with it
+# rusty-fork, wait-timeout and tempfile), which this crate has no use for: a codec test
+# that hangs or aborts is a bug to fix, not to contain.
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }
+
+[lints]
+workspace = true

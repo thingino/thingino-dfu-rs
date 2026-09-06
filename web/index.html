@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <!-- Don't cache the page shell so a redeploy is picked up without a hard reload.
+         (Hashed /assets/* are still cached immutably; only this HTML is no-store.) -->
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <!-- What this page is allowed to load, and nothing else.
+         Everything it needs is served beside it: the vite bundle, the sixteen
+         i18n dictionaries, rtl.css, the bundled Montserrat, the DFU loader
+         images under firmware/dfu/, sw.js, and the four .wasm modules (the
+         engine, and the three injector engines under wasm/). Hence 'self'
+         throughout. The parts that are not 'self':
+           script 'unsafe-inline'  the page's own onclick/onchange attributes
+                                   and the two inline <script> blocks here;
+           script 'wasm-unsafe-eval'  WebAssembly.instantiate is otherwise
+                                   blocked outright, and the engine IS wasm;
+           style 'unsafe-inline'   the <style> block below, and every
+                                   element.style the page sets as it runs;
+           img data:               the SVGs Bootstrap's CSS inlines;
+           connect api.github.com  the release listing (it sends CORS itself);
+           connect ...workers.dev  the firmware proxy that fetches the bytes;
+           connect http: https:    remote mode, where the daemon's address is
+                                   typed by the operator in Settings and can be
+                                   any host on their network.
+         frame-ancestors is deliberately absent: a <meta> policy cannot carry
+         it, and GitHub Pages sets no headers, so it would be a directive the
+         browser drops on the floor. -->
+    <meta http-equiv="Content-Security-Policy" content="
+        default-src 'self';
+        script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval';
+        style-src 'self' 'unsafe-inline';
+        img-src 'self' data:;
+        font-src 'self';
+        worker-src 'self';
+        connect-src 'self' https://api.github.com https://thingino-dfu-fw.thingino.workers.dev http: https:;
+        object-src 'none';
+        base-uri 'none';
+        form-action 'none'">
+    <title data-i18n="app_title">thingino · Web Flasher</title>
+    <script>
+        // Network-first page shell (via /sw.js) so a redeploy shows up on a normal
+        // reload — GitHub Pages caches the HTML for 10 min and ignores the meta above.
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', function () {
+                navigator.serviceWorker.register('sw.js').catch(function () {});
+            });
+        }
+    </script>
+    <link rel="icon" type="image/x-icon" href="/favicon.ico">
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+    <link rel="stylesheet" href="/rtl.css">
+    <style>
+        /* Montserrat is bundled via @fontsource (main.js), which ships every
+           subset with unicode-range so each language downloads only the scripts
+           it renders (latin for most, latin-ext for pl/tr, cyrillic for ru/uk;
+           ar and CJK have no Montserrat glyphs and fall back to the system
+           font). `html:root` (specificity 0,1,1) beats Bootstrap's own
+           `:root { --bs-font-sans-serif }` (0,1,0), whose bundled CSS loads
+           AFTER this inline block and would otherwise win the tie and reset the
+           font to system-ui. */
+        html:root { --bs-font-sans-serif: "Montserrat", sans-serif; }
+        /* `html body` (specificity 0,0,2) so this beats Bootstrap reboot's
+           `body { background-color: var(--bs-body-bg) }` (#212529), which the
+           bundled CSS loads AFTER this inline block. Overriding the page bg only
+           - NOT --bs-body-bg - keeps the cards at the Bootstrap gray (#212529). */
+        html body { min-height: 100vh; display: flex; flex-direction: column; align-items: center; background: #0d1117; }
+        .flasher-card { width: 100%; max-width: 720px; }
+        .card-title { color: darkorange !important; }
+        #log {
+            height: 406px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 0.78rem;
+            line-height: 1.4;
+            white-space: pre-wrap;
+            word-break: break-all;
+            background: #010409;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 0.6rem;
+        }
+        #log .info { color: #c9d1d9; }
+        #log .debug { color: #484f58; }
+        #log .warn { color: darkorange !important; }
+        #log .error { color: #f85149; }
+        .device-info { font-size: 0.9rem; }
+        .device-info .label { color: #8b949e; }
+        .device-info .value { color: darkorange !important; font-family: monospace; }
+        .progress { height: 14px; background-color: #21262d; border-radius: 6px; }
+        /* Theme-orange fill instead of the bright amber bg-warning. */
+        #progress-fill { background-color: #ff8c00 !important; }
+        /* High-contrast dark diagonal stripes - Bootstrap's default faint white
+           stripes are invisible on the bright bar. */
+        #progress-fill.progress-bar-striped {
+            background-image: linear-gradient(45deg,
+                rgba(13, 17, 23, 0.5) 25%, transparent 25%,
+                transparent 50%, rgba(13, 17, 23, 0.5) 50%,
+                rgba(13, 17, 23, 0.5) 75%, transparent 75%, transparent);
+            background-size: 1rem 1rem;
+        }
+        /* Drift the stripes rightward (Bootstrap's keyframe moves them left). */
+        #progress-fill.progress-bar-animated { animation-direction: reverse; }
+        #progress-label { color: #c9d1d9; font-size: 0.8rem; }
+        /* Busy-state status badge (Reading/Writing/Bootstrapping) is bg-warning
+           (yellow); Bootstrap defaults to white text on it - use dark instead. */
+        .badge.bg-warning { color: #0d1117 !important; }
+        .file-info { font-size: 0.85rem; color: #8b949e; }
+        /* Footer muted grey, matching the thingino image builder. */
+        .muted { color: #8b949e !important; }
+        input[type="file"] { display: none; }
+        @keyframes pulse-warn {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        /* "Click me" attention glow for the Connect button when a manual
+           re-pick is needed (e.g. first authorization of the DFU gadget). */
+        @keyframes connect-glow {
+            0%   { box-shadow: 0 0 0 0 rgba(255, 140, 0, 0.65); }
+            70%  { box-shadow: 0 0 0 9px rgba(255, 140, 0, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(255, 140, 0, 0); }
+        }
+        .btn-attention {
+            animation: connect-glow 1.3s infinite;
+            border-color: darkorange !important;
+            color: darkorange !important;
+            background-color: rgba(255, 140, 0, 0.08) !important;
+        }
+        /* Disabled actions read as clearly OFF: flat muted grey instead of a
+           dimmed accent color, so it's obvious at a glance which are live.
+           rel-flash is a solid btn-warning rather than an outline, so without
+           this it would only dim to a slightly darker yellow and still read as
+           clickable. Enabled, it stays solid yellow: it is the primary action. */
+        #btn-connect:disabled,
+        #btn-bootstrap:disabled,
+        #btn-write:disabled,
+        #btn-read:disabled,
+        #rel-flash:disabled {
+            color: #484f58 !important;
+            border-color: #30363d !important;
+            background-color: transparent !important;
+            opacity: 1 !important;
+            box-shadow: none !important;
+            cursor: not-allowed;
+        }
+        @media (max-width: 576px) {
+            body { padding: 0.5rem !important; }
+            .card-header { padding: 0.6rem 0.75rem; }
+            .card-body { padding: 0.75rem; }
+            .card-footer { padding: 0.75rem; }
+            .card-header .card-title { font-size: 0.95rem !important; }
+            #device-disconnected { text-align: center; }
+            #device-disconnected .btn { width: 100%; }
+            #device-disconnected .text-secondary { display: block; margin-top: 0.4rem; margin-left: 0 !important; }
+            #device-info .row { flex-direction: column; gap: 0.15rem !important; }
+            .card-footer .d-flex { flex-direction: column; }
+            .card-footer .d-flex .btn { width: 100%; }
+            #log { height: 313px; font-size: 0.7rem; }
+        }
+
+        /* Opt-in help balloons (toggled in Settings; off by default) */
+        /* About dialog: links carry the project's orange, like the image builder's do. */
+        .about-link { color:#ff9e2c; text-decoration:none; display:block; padding:.2rem 0; }
+        .about-link:hover, .about-link:focus { text-decoration:underline; }
+        body.help-on [data-help] { cursor: help; }
+        /* Bootstrap gives a disabled .btn pointer-events:none, which also hides it
+           from the elementFromPoint the balloons use -- so the hints would skip
+           exactly the controls a reader most wants explained: Bootstrap, Write,
+           Read and Diag all start disabled, before a device is connected. Hand
+           pointer events back while help is on. A disabled control still fires
+           no click, so nothing but the balloon changes. */
+        body.help-on [data-help]:disabled { pointer-events: auto; }
+        .help-balloon {
+            position: fixed; z-index: 1100; max-width: 260px;
+            background: #fffdf0; color: #1a1a1a;
+            border: 1px solid #c9bfa0; border-radius: 12px;
+            padding: 0.5rem 0.7rem; font-size: 0.8rem; line-height: 1.35;
+            box-shadow: 0 5px 16px rgba(0,0,0,0.28);
+            pointer-events: none; opacity: 0; transform: translateY(4px);
+            transition: opacity .12s ease, transform .12s ease;
+        }
+        .help-balloon.show { opacity: 1; transform: translateY(0); }
+        .help-balloon::before {
+            content: ""; position: absolute; top: -7px; left: 18px;
+            width: 12px; height: 12px; background: #fffdf0;
+            border-left: 1px solid #c9bfa0; border-top: 1px solid #c9bfa0;
+            transform: rotate(45deg);
+        }
+        .help-balloon.above::before {
+            top: auto; bottom: -7px;
+            border-left: 0; border-top: 0;
+            border-right: 1px solid #c9bfa0; border-bottom: 1px solid #c9bfa0;
+        }
+    </style>
+</head>
+<body class="p-3">
+
+<div class="flasher-card">
+    <!-- Header -->
+    <div class="card mb-3">
+        <div class="card-header d-flex align-items-center gap-2">
+            <h2 class="card-title mb-0 fs-5" style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;">
+                <i class="bi bi-cpu me-1"></i><span class="d-none d-sm-inline" data-i18n="header_full"> Thingino Web Flasher for Ingenic</span><span class="d-sm-none" data-i18n="header_short"> Thingino Flasher</span>
+            </h2>
+            <span id="status-badge" class="badge bg-secondary ms-auto" data-help="help_status_badge">Idle</span>
+            <span id="mode-indicator" class="badge bg-info-subtle text-info border border-info-subtle" data-i18n-title="title_mode" data-help="help_mode_indicator">DFU</span>
+            <button id="btn-about" class="btn btn-sm btn-outline-secondary py-0 px-1" onclick="openAbout()" data-i18n-title="about_title" data-help="help_about"><i class="bi bi-info-lg"></i></button>
+            <span id="btn-settings-wrap"><button id="btn-settings" class="btn btn-sm btn-outline-secondary py-0 px-1" onclick="openSettings()" data-i18n-title="title_settings" data-help="help_settings_button"><i class="bi bi-gear"></i></button></span>
+        </div>
+
+        <div id="op-warning" class="card-header bg-danger bg-opacity-10 text-danger text-center py-1 d-none" style="animation: pulse-warn 1.5s infinite;">
+            <i class="bi bi-exclamation-triangle-fill me-1"></i>
+            <small class="fw-600" data-i18n="op_warning">Do not disconnect the device or navigate away during this operation</small>
+        </div>
+
+        <!-- Device Info -->
+        <div class="card-body">
+            <div id="device-disconnected">
+                <button id="btn-connect" class="btn btn-outline-primary btn-sm" onclick="connectDevice()"
+                    data-bs-toggle="tooltip" data-i18n-title="title_connect"
+                    data-help="help_connect">
+                    <i class="bi bi-usb-symbol me-1"></i> <span data-i18n="btn_connect">Connect Device</span>
+                </button>
+                <a href="#" id="windows-help-link" class="small text-secondary text-decoration-none ms-2 d-none" onclick="openWindowsHelp(event)">
+                    <i class="bi bi-windows"></i> <span data-i18n="windows_help_link">Windows? You need a driver first</span>
+                </a>
+            </div>
+            <div id="device-info" class="device-info d-none">
+                <div id="device-picker-row" class="mb-2 d-none">
+                    <span class="label me-1" data-i18n="label_device">Device:</span>
+                    <select id="device-picker" class="form-select form-select-sm d-inline-block" style="width:auto;max-width:100%;vertical-align:middle"
+                        onchange="selectRemoteDevice(parseInt(this.value, 10))"></select>
+                </div>
+                <div class="row g-2">
+                    <div class="col-auto"><span class="label" data-i18n="label_soc">SoC:</span> <span class="value" id="info-soc">—</span></div>
+                    <div class="col-auto"><span class="label" data-i18n="label_stage">Stage:</span> <span class="value" id="info-stage">—</span></div>
+                    <div class="col-auto"><span class="label" data-i18n="label_vidpid">VID:PID:</span> <span class="value" id="info-vidpid">—</span></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Actions -->
+        <div class="card-footer">
+            <div class="d-flex flex-wrap align-items-center gap-2">
+                <button id="btn-bootstrap" class="btn btn-outline-success btn-sm" onclick="doBootstrap()" disabled
+                    data-bs-toggle="tooltip" data-i18n-title="title_bootstrap"
+                    data-help="help_bootstrap">
+                    <i class="bi bi-arrow-repeat me-1"></i> <span data-i18n="btn_bootstrap">Bootstrap</span>
+                </button>
+                <button id="btn-write" class="btn btn-outline-warning btn-sm" onclick="selectFirmware()" disabled
+                    data-bs-toggle="tooltip" data-i18n-title="title_write"
+                    data-help="help_write">
+                    <i class="bi bi-download me-1"></i> <span data-i18n="btn_write">Write Firmware</span>
+                </button>
+                <button id="btn-read" class="btn btn-outline-info btn-sm" onclick="doRead()" disabled
+                    data-bs-toggle="tooltip" data-i18n-title="title_read"
+                    data-help="help_read">
+                    <i class="bi bi-upload me-1"></i> <span data-i18n="btn_read">Read Firmware</span>
+                </button>
+                <button id="btn-diag" class="btn btn-outline-secondary btn-sm" onclick="doDiag()" disabled
+                    data-bs-toggle="tooltip" data-i18n-title="title_diag"
+                    data-help="help_diag">
+                    <i class="bi bi-info-circle me-1"></i> <span data-i18n="btn_diag">Info</span>
+                </button>
+            </div>
+            <div class="file-info mt-1" id="file-info"></div>
+            <input type="file" id="firmware-file" accept=".bin" onchange="firmwareSelected(this)">
+
+            <!-- Optional: bake files (Wi-Fi creds, SSH key, ...) into the image's overlay
+                 just before flashing. Repacked in the browser (WASM); nothing is uploaded. NOR + NAND.
+                 Hidden unless the user opts in via Settings, and collapsed until the
+                 header is clicked - same shape as the release picker and Advanced below. -->
+            <div class="mt-2 d-none" id="wifi-inject">
+                <a href="#" id="inject-toggle" class="small text-secondary text-decoration-none" onclick="toggleInject(event)" data-help="help_preconfig">
+                    <i class="bi bi-chevron-right" id="inject-chevron"></i>
+                    <span data-i18n="preconfig_label">Pre-configure before flashing (optional)</span>
+                </a>
+                <div id="inject-panel" class="d-none mt-2">
+                    <div class="d-flex flex-wrap gap-2">
+                        <input id="wifi-ssid" class="form-control form-control-sm" style="max-width:14rem" autocomplete="off" data-i18n-ph="wifi_ssid_ph" placeholder="Wi-Fi SSID">
+                        <input id="wifi-psk" type="password" class="form-control form-control-sm" style="max-width:14rem" autocomplete="off" data-i18n-ph="wifi_psk_ph" placeholder="Wi-Fi password">
+                    </div>
+                    <input id="ssh-key" class="form-control form-control-sm mt-2" autocomplete="off" data-i18n-ph="ssh_key_ph" placeholder="SSH public key for root login (optional)">
+                    <div id="extra-files" class="mt-1"></div>
+                    <button type="button" id="add-file-btn" class="btn btn-sm btn-outline-secondary mt-2" onclick="addExtraFileRow()" data-i18n="add_file_btn">+ Add a file</button>
+                    <div class="small text-secondary mt-1" data-i18n="wifi_hint">Baked into the overlay before writing, entirely in your browser.</div>
+                </div>
+            </div>
+
+            <!-- Flash a prebuilt thingino release straight from GitHub. The list
+                 comes from the GitHub API (CORS-clean); the image itself is
+                 fetched through /fw, which adds the header GitHub omits.
+                 Hidden unless the user opts in via Settings; starts d-none so it
+                 never flashes on load. -->
+            <div id="rel-wrap" class="mt-2 d-none">
+                <a href="#" id="rel-toggle" class="small text-secondary text-decoration-none" onclick="toggleReleases(event)" data-help="help_rel_toggle">
+                    <i class="bi bi-chevron-right" id="rel-chevron"></i>
+                    <span data-i18n="rel_toggle">Flash a prebuilt thingino release</span>
+                </a>
+                <div id="rel-panel" class="d-none mt-2">
+                    <div class="row g-2 align-items-center">
+                        <div class="col-12 col-md-2">
+                            <select id="rel-branch" class="form-select form-select-sm" onchange="branchChanged()" disabled data-help="help_rel_branch">
+                                <option value="master">master</option>
+                            </select>
+                        </div>
+                        <div class="col-12 col-md-3">
+                            <select id="rel-release" class="form-select form-select-sm" onchange="releaseChanged()" data-help="help_rel_release">
+                                <option value="" data-i18n="rel_loading">Loading releases...</option>
+                            </select>
+                        </div>
+                        <div class="col-12 col-md-5">
+                            <select id="rel-device" class="form-select form-select-sm" disabled data-help="help_rel_device">
+                                <option value="" data-i18n="rel_pick_release">Select a release first</option>
+                            </select>
+                        </div>
+                        <div class="col-12 col-md-2 d-grid">
+                            <button id="rel-flash" class="btn btn-warning btn-sm" onclick="flashFromRelease()" disabled data-help="help_rel_flash">
+                                <i class="bi bi-lightning-charge me-1"></i> <span data-i18n="rel_flash">Flash</span>
+                            </button>
+                        </div>
+                    </div>
+                    <div class="form-check mt-2" data-help="help_rel_all">
+                        <input class="form-check-input" type="checkbox" id="rel-all" onchange="releaseChanged()">
+                        <label class="form-check-label small muted" for="rel-all" data-i18n="rel_show_all">Show all devices (not just my SoC)</label>
+                    </div>
+                    <div class="small muted mt-1" id="rel-info"></div>
+                </div>
+            </div>
+
+            <!-- Advanced: optional custom DFU bootloader. Hidden unless the user
+                 opts in via Settings; starts d-none so it never flashes on load. -->
+            <div id="adv-wrap" class="mt-2 d-none">
+                <a href="#" id="adv-toggle" class="small text-secondary text-decoration-none" onclick="toggleAdvanced(event)" data-help="help_advanced">
+                    <i class="bi bi-chevron-right" id="adv-chevron"></i> <span data-i18n="adv_toggle">Advanced: custom SPL / U-Boot</span>
+                </a>
+                <div id="adv-controls" class="d-none mt-2 p-2 border rounded" style="border-color: #30363d !important;">
+                    <p class="small text-secondary mb-2" data-i18n-html="adv_desc">
+                        Optional. Supply your own DFU-capable <strong>SPL</strong> and <strong>U-Boot</strong> to use for
+                        the next <strong>Bootstrap</strong> instead of the bundled images. Both are required; SoC
+                        detection is skipped.
+                    </p>
+                    <div class="d-flex flex-wrap gap-2">
+                        <button id="btn-sel-spl" class="btn btn-outline-primary btn-sm" onclick="document.getElementById('custom-spl-file').click()" data-help="help_sel_spl">
+                            <i class="bi bi-file-earmark-binary me-1"></i> <span data-i18n="btn_sel_spl">Select SPL</span>
+                        </button>
+                        <button id="btn-sel-uboot" class="btn btn-outline-primary btn-sm" onclick="document.getElementById('custom-uboot-file').click()" data-help="help_sel_uboot">
+                            <i class="bi bi-file-earmark-binary me-1"></i> <span data-i18n="btn_sel_uboot">Select U-Boot</span>
+                        </button>
+                        <button id="btn-clear-custom" class="btn btn-outline-danger btn-sm" onclick="clearCustomBootloader()" data-help="help_clear_custom">
+                            <i class="bi bi-x-lg me-1"></i> <span data-i18n="btn_clear">Clear</span>
+                        </button>
+                    </div>
+                    <div class="file-info mt-2" id="custom-spl-info" data-i18n="custom_spl_bundled">SPL: bundled</div>
+                    <div class="file-info" id="custom-uboot-info" data-i18n="custom_uboot_bundled">U-Boot: bundled</div>
+                    <input type="file" id="custom-spl-file" accept=".bin" onchange="customSplSelected(this)">
+                    <input type="file" id="custom-uboot-file" accept=".bin" onchange="customUbootSelected(this)">
+                </div>
+            </div>
+
+            <div id="progress" class="mt-2 d-none">
+                <div class="progress">
+                    <div class="progress-bar bg-warning" id="progress-fill" role="progressbar" style="width: 0%"></div>
+                </div>
+                <small class="text-secondary" id="progress-label" data-i18n="progress_init">Initializing...</small>
+            </div>
+        </div>
+    </div>
+
+    <!-- Log -->
+    <div class="card">
+        <div class="card-header d-flex align-items-center gap-2">
+            <h2 class="card-title mb-0 fs-6">
+                <i class="bi bi-terminal me-1"></i> <span data-i18n="log_title">Log</span>
+            </h2>
+        </div>
+        <div class="card-body p-2">
+            <div id="log" data-help="help_log"></div>
+        </div>
+    </div>
+</div>
+
+<!-- Settings overlay -->
+<div id="settings-overlay" class="d-none" style="position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 1050; display: flex; align-items: center; justify-content: center; padding: 1rem;">
+    <div class="card flasher-card">
+        <div class="card-header d-flex align-items-center gap-2">
+            <h2 class="card-title mb-0 fs-6"><i class="bi bi-gear me-1"></i> <span data-i18n="settings_title">Settings</span></h2>
+        </div>
+        <div class="card-body">
+            <div class="d-flex align-items-center gap-2 mb-3">
+                <label class="small text-secondary mb-0" data-i18n="settings_lang">Language</label>
+                <span id="lang-slot"></span>
+            </div>
+            <p class="small text-secondary mb-2" data-i18n="settings_backend">Flashing backend</p>
+            <div class="form-check" data-help="help_setting_dfu">
+                <input class="form-check-input" type="radio" name="backend-mode" id="setting-dfu" value="dfu" onchange="toggleRemoteFields()">
+                <label class="form-check-label" for="setting-dfu" data-i18n-html="setting_dfu_label"><strong>DFU</strong> - U-Boot DFU mode (default)</label>
+            </div>
+            <div class="form-check" data-help="help_setting_remote">
+                <input class="form-check-input" type="radio" name="backend-mode" id="setting-remote" value="remote" onchange="toggleRemoteFields()">
+                <label class="form-check-label" for="setting-remote" data-i18n="setting_remote_label">Remote daemon - dfu-remote (HTTP)</label>
+            </div>
+            <div id="remote-fields" class="mt-2 ms-4 d-none">
+                <input type="text" class="form-control form-control-sm mb-1" id="remote-url" placeholder="http://192.168.1.50:5050" autocomplete="off" spellcheck="false" data-help="help_remote_url">
+                <input type="text" class="form-control form-control-sm" id="remote-token" data-i18n-ph="ph_remote_token" placeholder="auth token (optional)" autocomplete="off" spellcheck="false" data-help="help_remote_token">
+                <div class="small text-secondary mt-1"><i class="bi bi-info-circle me-1"></i><span data-i18n="remote_lna_note">Chrome will prompt once to allow local-network access.</span></div>
+            </div>
+            <hr class="my-2">
+            <p class="small text-secondary mb-2" data-i18n="settings_flashing">Flashing options</p>
+            <div class="form-check form-switch" data-help="help_setting_verify">
+                <input class="form-check-input" type="checkbox" id="setting-verify" onchange="setVerify(this.checked)">
+                <label class="form-check-label" for="setting-verify" data-i18n="setting_verify_label">Verify after write (read back and compare)</label>
+            </div>
+            <div class="form-check form-switch" data-help="help_setting_reboot">
+                <input class="form-check-input" type="checkbox" id="setting-reboot" onchange="setReboot(this.checked)">
+                <label class="form-check-label" for="setting-reboot" data-i18n="setting_reboot_label">Reboot after flashing (boot into the new image)</label>
+            </div>
+            <div class="form-check form-switch" data-help="help_setting_releases">
+                <input class="form-check-input" type="checkbox" id="setting-releases" onchange="setReleases(this.checked)">
+                <label class="form-check-label" for="setting-releases" data-i18n="setting_releases_label">Show Flash a prebuilt thingino release in the main view</label>
+            </div>
+            <div class="form-check form-switch" data-help="help_setting_advanced">
+                <input class="form-check-input" type="checkbox" id="setting-advanced" onchange="setAdvanced(this.checked)">
+                <label class="form-check-label" for="setting-advanced" data-i18n="setting_advanced_label">Show Advanced (custom SPL / U-Boot) in the main view</label>
+            </div>
+            <div class="form-check form-switch" data-help="help_setting_inject">
+                <input class="form-check-input" type="checkbox" id="setting-inject" onchange="setInject(this.checked)">
+                <label class="form-check-label" for="setting-inject" data-i18n="setting_inject_label">Show Pre-configure (Wi-Fi / SSH / files) in the main view</label>
+            </div>
+            <hr class="my-2">
+            <div class="form-check form-switch">
+                <input class="form-check-input" type="checkbox" id="setting-help" onchange="setHelp(this.checked)">
+                <label class="form-check-label" for="setting-help" data-i18n="setting_help_label">Show help hints: hover any control for a tip.</label>
+            </div>
+            <div class="form-check form-switch" data-help="help_setting_debug">
+                <input class="form-check-input" type="checkbox" id="setting-debug" onchange="setDebug(this.checked)">
+                <label class="form-check-label" for="setting-debug" data-i18n="setting_debug_label">Debug logging (verbose diagnostics)</label>
+            </div>
+        </div>
+        <div class="card-footer d-flex justify-content-end gap-2">
+            <button class="btn btn-outline-secondary btn-sm" onclick="closeSettings()" data-i18n="btn_cancel">Cancel</button>
+            <button class="btn btn-outline-primary btn-sm" onclick="saveSettings()" data-i18n="btn_save">Save</button>
+        </div>
+    </div>
+</div>
+
+<!-- About: what this flasher is, plus where the project lives. Static markup
+     rather than a page of its own, because every string here is already carried
+     by the dictionaries, so I18N.apply() translates it in place and a language
+     switch re-renders it with the rest of the page. -->
+<div id="about-overlay" class="d-none" style="position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 1050; display: flex; align-items: center; justify-content: center; padding: 1rem;">
+    <div class="card" style="width: 100%; max-width: 520px; max-height: 88vh;">
+        <div class="card-header d-flex align-items-center gap-2">
+            <h2 class="card-title mb-0 fs-6"><i class="bi bi-info-circle me-1"></i> <span data-i18n="about_title">About</span></h2>
+            <button type="button" id="about-close-x" class="btn-close btn-close-white ms-auto" onclick="closeAbout()"></button>
+        </div>
+        <div class="card-body small" style="overflow-y: auto;">
+            <p data-i18n="about_what">This page writes thingino firmware to an Ingenic camera over USB.</p>
+            <p data-i18n="about_project">thingino is free, open-source firmware for Ingenic-based IP cameras.</p>
+            <p class="muted mb-3"><i class="bi bi-exclamation-triangle me-1"></i><span data-i18n="about_caution">Flashing firmware can brick a camera.</span></p>
+            <p class="muted"><i class="bi bi-lightbulb me-1"></i><span data-i18n="about_hints">Hover hints for every control can be switched on in Settings.</span></p>
+            <p class="muted mb-1" data-i18n="about_links">Project links</p>
+            <a class="about-link" href="https://thingino.com/" target="_blank" rel="noopener"><i class="bi bi-globe me-2"></i><span data-i18n="about_site">thingino project site</span></a>
+            <a class="about-link" href="https://github.com/themactep/thingino-firmware/wiki" target="_blank" rel="noopener"><i class="bi bi-journal-text me-2"></i><span data-i18n="about_wiki">Documentation and camera wiki</span></a>
+            <a class="about-link" href="https://github.com/themactep/thingino-firmware" target="_blank" rel="noopener"><i class="bi bi-github me-2"></i><span data-i18n="about_firmware">thingino firmware source</span></a>
+            <a class="about-link" href="https://t.me/thingino" target="_blank" rel="noopener"><i class="bi bi-telegram me-2"></i><span data-i18n="about_telegram">Telegram group</span></a>
+            <a class="about-link" href="https://discord.gg/xDmqS944zr" target="_blank" rel="noopener"><i class="bi bi-discord me-2"></i><span data-i18n="about_discord">Discord server</span></a>
+            <a class="about-link" href="https://github.com/wltechblog/thingino-dfu" target="_blank" rel="noopener"><i class="bi bi-code-slash me-2"></i><span data-i18n="about_source">This flasher's source</span></a>
+        </div>
+        <div class="card-footer d-flex align-items-center gap-2">
+            <!-- Filled from the footer's own span, which the wasm sets once it is up. -->
+            <span class="small muted"><span data-i18n="about_version">Flasher version</span> <code id="about-version">…</code></span>
+            <button class="btn btn-outline-secondary btn-sm ms-auto" onclick="closeAbout()" data-i18n="btn_close">Close</button>
+        </div>
+    </div>
+</div>
+
+<!-- Diagnostics (Info) overlay -->
+<div id="diag-overlay" class="d-none" style="position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 1050; display: flex; align-items: center; justify-content: center; padding: 1rem;">
+    <div class="card flasher-card" style="max-width: 46rem; width: 100%;">
+        <div class="card-header d-flex align-items-center gap-2">
+            <h2 class="card-title mb-0 fs-6"><i class="bi bi-info-circle me-1"></i> <span data-i18n="diag_title">Device Info</span></h2>
+            <button class="btn btn-sm btn-outline-secondary py-0 px-1 ms-auto" onclick="closeDiag()" data-i18n-title="title_close"><i class="bi bi-x-lg"></i></button>
+        </div>
+        <div class="card-body">
+            <pre id="diag-output" class="small mb-0" style="white-space: pre; overflow: auto; max-height: 60vh; font-family: var(--bs-font-monospace, monospace);">No data.</pre>
+        </div>
+        <div class="card-footer d-flex justify-content-end gap-2">
+            <button class="btn btn-outline-secondary btn-sm" onclick="copyDiag()"><i class="bi bi-clipboard me-1"></i> <span data-i18n="btn_copy">Copy</span></button>
+            <button class="btn btn-outline-primary btn-sm" onclick="closeDiag()" data-i18n="btn_close">Close</button>
+        </div>
+    </div>
+</div>
+
+<!-- Windows driver help overlay -->
+<div id="windows-help-overlay" class="d-none" style="position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 1050; display: flex; align-items: center; justify-content: center; padding: 1rem;">
+    <div class="card flasher-card">
+        <div class="card-header d-flex align-items-center gap-2">
+            <h2 class="card-title mb-0 fs-6"><i class="bi bi-windows me-1"></i> <span data-i18n="win_title">Windows Driver Setup</span></h2>
+            <button class="btn btn-sm btn-outline-secondary py-0 px-1 ms-auto" onclick="closeWindowsHelp()" data-i18n-title="title_close"><i class="bi bi-x-lg"></i></button>
+        </div>
+        <div class="card-body">
+            <p class="text-secondary" data-i18n="win_intro">Windows needs a WinUSB driver installed before the web flasher can communicate with the device. Follow these steps:</p>
+            <ol class="lh-lg">
+                <li data-i18n-html="win_step1">If the Ingenic vendor USB driver is installed, remove it first via <strong>Device Manager</strong>.</li>
+                <li data-i18n="win_step2">Connect the device in USB boot mode.</li>
+                <li data-i18n-html="win_step3">Download and run <a href="https://zadig.akeo.ie/" target="_blank" class="text-warning">Zadig <i class="bi bi-box-arrow-up-right" style="font-size:0.7rem"></i></a>.</li>
+                <li data-i18n-html="win_step4">In Zadig, select <strong>Ingenic USB Boot Device</strong> from the dropdown.</li>
+                <li data-i18n-html="win_step5">Set the target driver to <strong>WinUSB</strong> and click <strong>Install</strong> (or <strong>Replace Driver</strong>).</li>
+                <li data-i18n-html="win_step6">Return to this page and click <strong>Connect Device</strong>.</li>
+            </ol>
+            <div class="alert alert-warning small mb-0">
+                <i class="bi bi-exclamation-triangle me-1"></i>
+                <span data-i18n-html="win_important"><strong>Important:</strong> The Ingenic vendor driver (<code>libusb0.sys</code>) is not compatible and must be removed before installing WinUSB via Zadig.</span>
+            </div>
+        </div>
+        <div class="card-footer d-flex justify-content-end gap-2">
+            <button class="btn btn-outline-primary btn-sm" onclick="closeWindowsHelp()" data-i18n="btn_got_it">Got it</button>
+        </div>
+    </div>
+</div>
+
+<p class="mt-2 small text-center muted" id="version-text"><a href="https://github.com/wltechblog/thingino-dfu" target="_blank" class="link-secondary text-decoration-none" data-help="help_version">thingino-dfu</a> <span id="version-num"></span></p>
+
+<div id="browser-warning" class="alert alert-danger flasher-card mt-3 text-center d-none">
+    <i class="bi bi-exclamation-triangle me-1"></i>
+    <span data-i18n-html="browser_warning">WebUSB requires <strong>HTTPS</strong> (or localhost) and <strong>Chrome</strong> or <strong>Edge</strong>.</span>
+</div>
+
+<!-- i18n: tiny runtime + per-language dicts (plain scripts, run before the app module) -->
+<script src="/i18n.js"></script>
+<script src="/i18n-dfu-en.js"></script>
+<script src="/i18n-dfu-es.js"></script>
+<script src="/i18n-dfu-fr.js"></script>
+<script src="/i18n-dfu-de.js"></script>
+<script src="/i18n-dfu-zh-CN.js"></script>
+<script src="/i18n-dfu-pt.js"></script>
+<script src="/i18n-dfu-ru.js"></script>
+<script src="/i18n-dfu-ja.js"></script>
+<script src="/i18n-dfu-it.js"></script>
+<script src="/i18n-dfu-nl.js"></script>
+<script src="/i18n-dfu-pl.js"></script>
+<script src="/i18n-dfu-tr.js"></script>
+<script src="/i18n-dfu-uk.js"></script>
+<script src="/i18n-dfu-ar.js"></script>
+<script src="/i18n-dfu-ko.js"></script>
+<script type="module" src="/src/main.js"></script>
+</body>
+</html>
