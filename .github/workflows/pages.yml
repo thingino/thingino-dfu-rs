@@ -1,0 +1,126 @@
+name: Pages
+
+# The web flasher, deployed to GitHub Pages: webflash.thingino.com once that domain is on
+# this repository, https://thingino.github.io/thingino-dfu-rs/ until then. Two ways in:
+# release.yml calls this after a tag has published, so the site tracks releases, and a
+# manual dispatch on any branch redeploys without one. The page is built exactly as
+# `package (web)` builds it in release.yml; only the base path differs, and it is read off
+# the repository's Pages settings ('/' on a custom domain, '/<repo>/' on the project URL).
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+# One deploy at a time, never cancelled: a half-deployed site is worse than a queued one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    name: build the flasher
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out
+        run: |
+          git init -q .
+          # The token on the fetch, never in .git/config: see ci.yml's gate job.
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c http.extraheader="AUTHORIZATION: basic $auth" \
+            fetch -q --depth 1 --no-tags "https://github.com/${GITHUB_REPOSITORY}" "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+
+      - name: Build identity
+        run: echo "TDFU_GIT_HASH=$(git rev-parse --short=7 "$GITHUB_SHA")" >> "$GITHUB_ENV"
+
+      - name: Rust target
+        run: rustup target add wasm32-unknown-unknown
+
+      # As in release.yml: the two wasm-bindgen binaries must match the crate the
+      # workspace resolved to, and `cargo xtask web` is the one reader of that version.
+      - name: wasm-bindgen CLI
+        run: |
+          ver=$(cargo xtask web --print-wasm-bindgen-version)
+          test -n "$ver" || { echo "cargo xtask web could not resolve wasm-bindgen"; exit 1; }
+          echo "wasm-bindgen $ver"
+          asset="wasm-bindgen-${ver}-x86_64-unknown-linux-musl.tar.gz"
+          gh release download "$ver" -R wasm-bindgen/wasm-bindgen --pattern "$asset" --dir /tmp --clobber
+          tar xzf "/tmp/$asset" -C /tmp --strip-components 1
+          mkdir -p "$HOME/.cargo/bin"
+          install -m 0755 /tmp/wasm-bindgen "$HOME/.cargo/bin/wasm-bindgen"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          command -v wasm-bindgen
+
+      # The page fetches firmware/dfu/<variant>/{tpl,spl,uboot}.bin for a local bootstrap,
+      # and `cargo xtask web` links that tree into web/public only when one has been
+      # fetched. Before the page build, not after.
+      - name: Loader tree
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo xtask fetch-loaders
+
+      # Where the site will be served from decides the base every asset URL starts with:
+      # a custom domain serves it at '/', the project URL at '/<repo>/'. Read off the
+      # repository's Pages settings at build time, so moving the domain needs no edit here.
+      - name: Base path
+        run: |
+          cname=$(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq '.cname // ""')
+          if [ -n "$cname" ]; then
+            base="/"
+          else
+            base="/${GITHUB_REPOSITORY#*/}/"
+          fi
+          echo "custom domain: ${cname:-none}; base: $base"
+          echo "PAGES_BASE=$base" >> "$GITHUB_ENV"
+
+      - name: Build the web flasher
+        run: |
+          node --version
+          major=$(node -p 'process.versions.node.split(".")[0]')
+          if [ "$major" -lt 20 ] || [ "$major" -eq 21 ]; then
+            echo "vite wants node 20, 22 or newer; this is $major"
+            exit 1
+          fi
+          cargo xtask web --release
+
+      # A page with no loaders bootstraps nothing; a page built for the wrong base loads
+      # nothing. Both are checked before anything is uploaded.
+      - name: What was built
+        run: |
+          test -d web/dist/firmware/dfu || { echo "no loader tree in web/dist"; exit 1; }
+          grep -q "\"${PAGES_BASE}assets/" web/dist/index.html \
+            || { echo "index.html does not reference assets under ${PAGES_BASE}"; exit 1; }
+          du -sh web/dist
+          ls web/dist
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: web/dist
+
+  deploy:
+    name: deploy
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

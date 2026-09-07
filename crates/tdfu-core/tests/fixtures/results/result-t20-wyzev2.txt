@@ -1,0 +1,13 @@
+device: a108:c309 "?	 USB Boot Device"
+magic:  "T20V"
+
+[1] registers via kseg1 (0xB3......), the address form --diag uses:
+  soc_id       @0xB300002C = 0x12000002
+  subsoctype1  @0xB3540238 = 0x22220000
+  subsoctype2  @0xB3540250 = 0x00000000
+
+  cpu_id=0x2000  sub1=0x2222  sub2=0x0000
+  => T20X   (loader dir: t20x)
+
+  window[+0x38] = 0x22220000  == subsoctype1 (match)
+  window[+0x50] = 0x00000000  == subsoctype2 (match)
