@@ -45,7 +45,7 @@ var customUboot = null;
 /* Backend: 'dfu' (default) drives the on-device U-Boot DFU gadget; 'remote'
  * proxies to a dfu-remote daemon. Persisted across reloads. */
 var backendMode = localStorage.getItem('tdfu_backend') || 'dfu';
-var inDfuMode = false; /* connected device is a U-Boot DFU gadget (a108:4d44) */
+var inDfuMode = false; /* connected device is a U-Boot DFU gadget */
 
 /* Remote daemon backend state. The transport is fetch(), not WebSocket; see the
  * header of remote.js for why. */
@@ -494,8 +494,9 @@ async function connectDevice() {
         deviceId = info.id;
 
         // A U-Boot DFU gadget is ready to flash directly. It is recognised by its
-        // DFU interface, not by the 0x4D44 PID, so a gadget re-PID'd to the
-        // bootrom's 0xC309 is still read as a gadget.
+        // DFU interface, never by a PID: the gadget was re-PID'd to the bootrom's
+        // 0xC309 in 2026-07, so both stages of a flash share one VID:PID and only
+        // the descriptors tell them apart.
         if (info.stage === 'dfu') {
             inDfuMode = true;
             showDeviceInfo(socLabel(), 'U-Boot DFU',
@@ -535,12 +536,12 @@ async function connectDevice() {
  * sweep at load, because a device that is already present when the page opens
  * was not re-enumerated and the user has not asked for anything yet.
  *
- * This is what removes the manual re-pick after a bootstrap: once the DFU
- * gadget (a108:4d44) has been authorized once, WebUSB persists that grant, so
- * when the device re-enumerates the 'connect' event fires and we wire it up
- * automatically. The very first authorization still needs one chooser click
- * (WebUSB won't surface a device that isn't present yet, and the PID changes
- * across re-enumeration).
+ * This is what removes the manual re-pick after a bootstrap: the bootrom and the
+ * DFU gadget share one VID:PID (a108:c309), so the grant the user gave the
+ * bootrom still covers the gadget that replaces it, and when the device
+ * re-enumerates the 'connect' event fires and we wire it up automatically. The
+ * very first authorization still needs one chooser click, because WebUSB will not
+ * surface a device that is not present yet.
  *
  * Every await below can reject, and this one runs with no user waiting on a
  * promise: it is called from an event listener, so a rejection lands nowhere at

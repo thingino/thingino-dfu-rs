@@ -8,10 +8,11 @@ Based on the original thingino-dfu by wltechblog,
 [wltechblog/thingino-dfu](https://github.com/wltechblog/thingino-dfu): the C tool whose
 behaviour this rewrite reproduces, whose USB loaders it still uses, and whose device
 protocols, command line, daemon wire format and browser flasher it keeps compatible. That
-repository is archived; this one continues it. The USB loaders are the thingino USB-boot
-builds of U-Boot published by [gtxaspec/u-boot](https://github.com/gtxaspec/u-boot) in its
-`usbboot` release: every build fetches the latest ones, and each release archive names
-the U-Boot commit its loaders were built from.
+repository is still the C tool's home; this is a separate implementation of the same tool,
+not a fork of it. The USB loaders are the thingino USB-boot builds of U-Boot published by
+[gtxaspec/u-boot](https://github.com/gtxaspec/u-boot) in its `usbboot` release: every build
+fetches the latest ones, and each release archive names the U-Boot commit its loaders were
+built from.
 
 ## What it does
 
@@ -56,7 +57,7 @@ rule.
 
 ```
 sudo tee /etc/udev/rules.d/99-thingino-dfu.rules >/dev/null <<'EOF'
-# bootrom a108:c309, U-Boot DFU gadget a108:4d44
+# the bootrom and the U-Boot DFU gadget, both a108:c309
 SUBSYSTEM=="usb", ATTR{idVendor}=="a108", MODE="0666", TAG+="uaccess"
 # X series bootrom
 SUBSYSTEM=="usb", ATTR{idVendor}=="601a", MODE="0666", TAG+="uaccess"
@@ -67,10 +68,13 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 Then unplug and replug the camera; without the rule the tool reports access denied.
 
 **Windows** has no built-in driver the tool can claim, so install WinUSB with
-[Zadig](https://zadig.akeo.ie/), once for each of the two USB devices. Remove the Ingenic
-vendor driver (`libusb0.sys`) first if it is installed; then Zadig on **Ingenic USB Boot
-Device** (`A108:C309`), bootstrap with `thingino-dfu.exe -b`, and Zadig again on the **USB
-download gadget** (`A108:4D44`) that appears. One time, per machine.
+[Zadig](https://zadig.akeo.ie/). Remove the Ingenic vendor driver (`libusb0.sys`) first if
+it is installed. The catch: over one flash cycle the camera appears as two different USB
+devices, the bootrom before bootstrap and the U-Boot DFU gadget after, and Zadig only
+assigns a driver to the device plugged in right now. So run it twice: on **Ingenic USB
+Boot Device**, then bootstrap with `thingino-dfu.exe -b`, then again on the **USB download
+gadget** that replaces it. Both stages enumerate as `A108:C309`, so pick them by name in
+Zadig's list rather than by id. One time, per machine; Windows remembers each.
 
 **macOS** needs nothing: the binaries are universal and macOS grants USB access to the
 user. A downloaded archive is quarantined, so `xattr -dr com.apple.quarantine

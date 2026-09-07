@@ -694,7 +694,7 @@ fn install_text(os: Platform) -> &'static str {
              \n\
              ```\n\
              sudo tee /etc/udev/rules.d/99-thingino-dfu.rules >/dev/null <<'EOF'\n\
-             # bootrom a108:c309, U-Boot DFU gadget a108:4d44\n\
+             # the bootrom and the U-Boot DFU gadget, both a108:c309\n\
              SUBSYSTEM==\"usb\", ATTR{idVendor}==\"a108\", MODE=\"0666\", TAG+=\"uaccess\"\n\
              # X series bootrom, for the day it speaks DFU\n\
              SUBSYSTEM==\"usb\", ATTR{idVendor}==\"601a\", MODE=\"0666\", TAG+=\"uaccess\"\n\
@@ -707,19 +707,22 @@ fn install_text(os: Platform) -> &'static str {
         }
         Platform::Windows => {
             "Windows has no built-in driver this tool can claim, so install **WinUSB** with\n\
-             [Zadig](https://zadig.akeo.ie/) - twice, because a camera is two different USB\n\
-             devices over one flash cycle and WinUSB is bound per device:\n\
+             [Zadig](https://zadig.akeo.ie/) - twice. Over one flash cycle the camera is two\n\
+             different USB devices, the bootrom and then the U-Boot DFU gadget, and Zadig only\n\
+             assigns a driver to the device that is plugged in right now:\n\
              \n\
              1. If the Ingenic vendor driver (`libusb0.sys`) is installed, remove it first in\n\
              \x20  Device Manager. It is not compatible with this tool.\n\
              2. Put the camera in USB boot mode. Open Zadig (Options -> List All Devices),\n\
-             \x20  select **Ingenic USB Boot Device** (`A108:C309`) and install WinUSB.\n\
-             3. Bootstrap: `thingino-dfu.exe -b`. The camera re-enumerates as a new device.\n\
-             4. Run Zadig again, select **USB download gadget** (`A108:4D44`) and install WinUSB.\n\
+             \x20  select **Ingenic USB Boot Device** and install WinUSB.\n\
+             3. Bootstrap: `thingino-dfu.exe -b`. The camera re-enumerates as the gadget.\n\
+             4. Run Zadig again, select **USB download gadget** and install WinUSB.\n\
              \n\
-             Skip step 4 and the bootstrap succeeds while the write that follows cannot open the\n\
-             device. It is a one-time setup per machine; after it, `thingino-dfu.exe -w fw.bin`\n\
-             does bootstrap-and-write in one go.\n"
+             Both stages enumerate as `A108:C309` - the product string is what tells them\n\
+             apart - so pick them by name in Zadig's list rather than by id. Skip step 4 and\n\
+             the bootstrap succeeds while the write that follows cannot open the device. It is\n\
+             a one-time setup per machine; after it, `thingino-dfu.exe -w fw.bin` does\n\
+             bootstrap-and-write in one go.\n"
         }
         Platform::MacOs => {
             "Nothing to install. The binaries are universal (arm64 and x86_64) and macOS grants\n\
@@ -1901,7 +1904,15 @@ fn usage() -> String {
     fn each_os_gets_its_own_install_step() -> TestResult {
         let windows = render_readme(&facts(find_target("windows-x64")?));
         assert!(windows.contains("Zadig"), "{windows}");
-        assert!(windows.contains("A108:4D44"), "both drivers");
+        // Both Zadig passes, and no obsolete id: the gadget shares the bootrom's
+        // `A108:C309` (re-PID'd 2026-07-24), so a README naming `A108:4D44` sends a
+        // Windows user hunting for a device that never appears.
+        assert!(
+            windows.contains("Ingenic USB Boot Device"),
+            "the bootrom pass: {windows}"
+        );
+        assert!(windows.contains("USB download gadget"), "the gadget pass: {windows}");
+        assert!(!windows.contains("4D44"), "the retired gadget id: {windows}");
         assert!(!windows.contains("udevadm"), "no udev on Windows");
         assert!(windows.contains("thingino-dfu.exe"), "the exe suffix");
 
