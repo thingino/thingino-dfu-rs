@@ -686,9 +686,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "log",
  "once_cell",
@@ -884,7 +884,7 @@ dependencies = [
 
 [[package]]
 name = "tdfu-cli"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "clap",
  "socket2",
@@ -898,7 +898,7 @@ dependencies = [
 
 [[package]]
 name = "tdfu-core"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "tdfu-usb",
  "thiserror 2.0.20",
@@ -906,7 +906,7 @@ dependencies = [
 
 [[package]]
 name = "tdfu-daemon"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "socket2",
  "tdfu-core",
@@ -920,7 +920,7 @@ dependencies = [
 
 [[package]]
 name = "tdfu-jni"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "jni",
  "tdfu-core",
@@ -930,7 +930,7 @@ dependencies = [
 
 [[package]]
 name = "tdfu-proto"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "proptest",
  "thiserror 2.0.20",
@@ -938,7 +938,7 @@ dependencies = [
 
 [[package]]
 name = "tdfu-usb"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "nusb",
  "thiserror 2.0.20",
@@ -946,7 +946,7 @@ dependencies = [
 
 [[package]]
 name = "tdfu-wasm"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "js-sys",
  "tdfu-core",
@@ -1505,7 +1505,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "xtask"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "flate2",
  "serde",
