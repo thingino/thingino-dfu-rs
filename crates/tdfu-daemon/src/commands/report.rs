@@ -72,7 +72,25 @@ impl Queue {
     /// let done = pump(conn, cmd, &queue, ops::write(&dev, clock, alt, image, &mut sink)).await?;
     /// ```
     pub fn sink(&self) -> impl FnMut(Progress) + '_ {
-        move |progress| self.events.borrow_mut().push_back(progress)
+        move |progress| self.push(progress)
+    }
+
+    /// Queue `progress`, folding it into an unsent byte count of the same phase.
+    ///
+    /// A count the pump has not sent yet is stale once the next one arrives, and they
+    /// only pile up at all when an operation runs many blocks without yielding, as over
+    /// a USB backend that blocks in each transfer. Keeping every one of them would grow
+    /// the queue with the image: 32 bytes a block, 2 MiB for a 256 MiB NAND read.
+    fn push(&self, progress: Progress) {
+        let mut events = self.events.borrow_mut();
+        if let Progress::Bytes { phase, .. } = &progress
+            && let Some(last) = events.back_mut()
+            && matches!(last, Progress::Bytes { phase: queued, .. } if queued == phase)
+        {
+            *last = progress;
+            return;
+        }
+        events.push_back(progress);
     }
 
     fn pop(&self) -> Option<Progress> {
@@ -1083,9 +1101,52 @@ mod tests {
                     done,
                     total: Some(500),
                 });
+                yield_once().await;
             }
         }))?;
         assert_eq!(conn.progress_frames().len(), 500);
+        Ok(())
+    }
+
+    /// **Counts the pump has not sent fold into the latest**, so an operation that runs
+    /// many blocks without yielding cannot grow the queue with the image: over a USB
+    /// backend that blocks in each transfer, a 16 MiB read queued 4096 of them, 128 KiB.
+    /// Anything else between two counts keeps both, in order.
+    #[test]
+    fn unsent_counts_fold_into_the_latest() -> TestResult {
+        let mut conn = LoopbackConn::raw().during(Command::Read);
+        let queue = Queue::new();
+        let mut sink = queue.sink();
+        let count = |done| Progress::Bytes {
+            phase: Phase::Upload,
+            done,
+            total: None,
+        };
+        block_on(pump(&mut conn, Command::Read, &queue, async {
+            for done in 1..=4096_u64 {
+                sink(count(done * 4096));
+            }
+            assert_eq!(queue.events.borrow().len(), 1, "the queue holds one count");
+            sink(Progress::Note("between".to_owned()));
+            sink(count(1));
+            sink(count(2));
+        }))?;
+        assert_eq!(
+            conn.sent(),
+            vec![
+                Sent::Progress(ProgressBody {
+                    percent: 0,
+                    stage: Phase::Upload.wire_byte(),
+                    message: "16777216 bytes".to_owned(),
+                }),
+                Sent::Log("between\n".to_owned()),
+                Sent::Progress(ProgressBody {
+                    percent: 0,
+                    stage: Phase::Upload.wire_byte(),
+                    message: "2 bytes".to_owned(),
+                }),
+            ]
+        );
         Ok(())
     }
 
