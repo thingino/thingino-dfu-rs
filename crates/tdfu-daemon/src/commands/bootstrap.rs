@@ -1017,13 +1017,17 @@ mod tests {
         .encode()
     }
 
-    /// **A streamed pair reaches the bootrom as a whole one does**: the same uploads, in
-    /// the same chunks, which the scripted bootrom checks request by request. U-Boot is
-    /// over two bootrom chunks here, so it crosses a chunk boundary while streaming.
+    /// **A streamed pair reaches the bootrom as a whole one does**: the same uploads, with
+    /// U-Boot's chunks sent a piece at a time so the daemon never holds one whole, which
+    /// the scripted bootrom checks request by request. U-Boot is over two bootrom chunks
+    /// here, so it crosses a chunk boundary while streaming.
     #[test]
     fn a_streamed_bootstrap_sends_the_pair_it_was_given() -> TestResult {
         let (spl, uboot) = (pattern(3000), pattern(150_000));
-        let backend = FakeBackend::new(vec![FakeBackend::bootstrappable_bootrom(spl.clone(), uboot.clone())]);
+        let backend = FakeBackend::new(vec![FakeBackend::bootstrappable_bootrom_streaming(
+            spl.clone(),
+            uboot.clone(),
+        )]);
         // The limit is also the most the daemon holds, and the stage-1 image is held.
         let mut state = daemon(backend, std::path::Path::new("/nonexistent-firmware-dir")).with_stream_above(4096);
         block_on(seen(&mut state))?;

@@ -857,7 +857,20 @@ impl FakeBackend {
         FakeDevice {
             descriptors: bootrom_descriptors(1, 7, vec![4, 2]),
             opens: Opens::Script(Box::new(move |descriptors| {
-                bootstrap_script(descriptors.clone(), &stage1, &uboot)
+                bootstrap_script(descriptors.clone(), &stage1, &uboot, bootrom::BULK_CHUNK)
+            })),
+        }
+    }
+
+    /// [`bootstrappable_bootrom`](Self::bootstrappable_bootrom) for a U-Boot that streams
+    /// in with the request, so it reaches the bootrom in pieces of the intake's
+    /// [`INTAKE_HOLD`](super::report::INTAKE_HOLD).
+    #[must_use]
+    pub fn bootstrappable_bootrom_streaming(stage1: Vec<u8>, uboot: Vec<u8>) -> FakeDevice {
+        FakeDevice {
+            descriptors: bootrom_descriptors(1, 7, vec![4, 2]),
+            opens: Opens::Script(Box::new(move |descriptors| {
+                bootstrap_script(descriptors.clone(), &stage1, &uboot, super::report::INTAKE_HOLD)
             })),
         }
     }
@@ -1091,8 +1104,15 @@ fn diag_script(descriptors: DeviceDescriptors, soc_id: u32, window: Vec<u8>) -> 
     device.expecting(Call::ReleaseInterface(0), Reply::Done)
 }
 
-/// One padded image's upload, exactly as `ops::bootstrap` puts it on the wire.
-fn upload_script(mut device: MockTransport, in_configuration: &mut bool, address: u32, image: &[u8]) -> MockTransport {
+/// One padded image's upload, exactly as `ops::bootstrap` puts it on the wire: a bulk
+/// transfer per chunk, or per `piece` of each chunk for an image that streams in.
+fn upload_script(
+    mut device: MockTransport,
+    in_configuration: &mut bool,
+    address: u32,
+    image: &[u8],
+    piece: usize,
+) -> MockTransport {
     device = device
         .expecting(vendor_word(bootrom::request::SET_DATA_ADDR, address), Reply::Done)
         .expecting(
@@ -1107,35 +1127,50 @@ fn upload_script(mut device: MockTransport, in_configuration: &mut bool, address
         *in_configuration = true;
     }
     device = device.expecting(Call::ClaimInterface(bootrom::INTERFACE), Reply::Done);
-    // One bulk transfer per chunk, as the bootrom sees them.
     for chunk in image.chunks(bootrom::BULK_CHUNK) {
-        device = device.expecting(Call::BulkOut { data: chunk.to_vec() }, Reply::Transferred(chunk.len()));
+        for part in chunk.chunks(piece) {
+            device = device.expecting(Call::BulkOut { data: part.to_vec() }, Reply::Transferred(part.len()));
+        }
     }
     device.expecting(Call::ReleaseInterface(0), Reply::Done)
 }
 
 /// A whole successful bootstrap of `stage1` + `uboot` (raw; the script pads with the
 /// op's own rule, so it mirrors the wire rather than the files).
-fn bootstrap_script(descriptors: DeviceDescriptors, stage1: &[u8], uboot: &[u8]) -> MockTransport {
-    bootstrap_onto(MockTransport::new(descriptors), false, stage1, uboot)
+fn bootstrap_script(descriptors: DeviceDescriptors, stage1: &[u8], uboot: &[u8], piece: usize) -> MockTransport {
+    bootstrap_onto(MockTransport::new(descriptors), false, stage1, uboot, piece)
 }
 
 /// The same, appended to a script that has already configured the device — the
 /// detect-then-bootstrap case.
 fn bootstrap_after(device: MockTransport, stage1: &[u8], uboot: &[u8]) -> MockTransport {
-    bootstrap_onto(device, true, stage1, uboot)
+    bootstrap_onto(device, true, stage1, uboot, bootrom::BULK_CHUNK)
 }
 
-fn bootstrap_onto(mut device: MockTransport, configured: bool, stage1: &[u8], uboot: &[u8]) -> MockTransport {
+/// `uboot_piece` is how U-Boot reaches the bootrom: whole chunks, or pieces when it
+/// streams in with the request. The stage-1 image is always held whole.
+fn bootstrap_onto(
+    mut device: MockTransport,
+    configured: bool,
+    stage1: &[u8],
+    uboot: &[u8],
+    uboot_piece: usize,
+) -> MockTransport {
     let stage1 = bootrom::pad_stage1(stage1);
     let uboot = bootrom::pad_stage1(uboot);
     let mut in_configuration = configured;
-    device = upload_script(device, &mut in_configuration, bootrom::SPL_LOAD_ADDR, &stage1);
+    device = upload_script(
+        device,
+        &mut in_configuration,
+        bootrom::SPL_LOAD_ADDR,
+        &stage1,
+        bootrom::BULK_CHUNK,
+    );
     device = device.expecting(
         vendor_word(bootrom::request::PROG_STAGE1, bootrom::SPL_ENTRY_ADDR),
         Reply::Done,
     );
-    device = upload_script(device, &mut in_configuration, bootrom::UBOOT_ADDR, &uboot);
+    device = upload_script(device, &mut in_configuration, bootrom::UBOOT_ADDR, &uboot, uboot_piece);
     device
         .expecting(vendor_word(bootrom::request::FLUSH_CACHE, 0), Reply::Done)
         .expecting(

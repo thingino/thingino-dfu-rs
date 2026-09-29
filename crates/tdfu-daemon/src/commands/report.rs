@@ -103,9 +103,13 @@ impl Queue {
 }
 
 /// The most an operation is handed from a streamed payload in one step, whatever it asks
-/// for at once: a bootrom chunk is 64 KiB, and a daemon on a microcontroller should hold
-/// that chunk once, not twice.
+/// for at once, so the intake's own buffer stays small.
 const INTAKE_STEP: usize = 4 * 1024;
+
+/// The most an operation should hold of a streamed payload at once, which the intake
+/// asks of it ([`AsyncSource::hold_at_most`]): a bootrom chunk is 64 KiB, and a daemon on
+/// a microcontroller without external RAM has no 64 KiB block to give it.
+pub const INTAKE_HOLD: usize = 16 * 1024;
 
 /// How much of a streamed reply an operation may leave before it waits for the pump.
 const OUTBOX_CAPACITY: usize = 4 * 1024;
@@ -177,6 +181,10 @@ impl AsyncSource for IntakeSource<'_> {
             piece.copy_from_slice(bytes);
         }
         Ok(())
+    }
+
+    fn hold_at_most(&self) -> Option<usize> {
+        Some(INTAKE_HOLD)
     }
 }
 
