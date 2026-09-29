@@ -21,6 +21,7 @@ use crate::dfu::host::{self, Transaction};
 use crate::error::{Error, Result};
 use crate::model::{AltSel, DfuInfo};
 use crate::progress::{Phase, Progress, ProgressSink};
+use crate::stream::{AsyncSink, SyncSink};
 
 /// Upload from `alt` into `out`, at most `limit` bytes, returning how many were read.
 ///
@@ -68,7 +69,24 @@ pub async fn read<T: LocalUsbTransport, C: Sleeper>(
     out: &mut dyn std::io::Write,
     progress: ProgressSink<'_>,
 ) -> Result<u64> {
-    let mut output = Output::new(out, limit);
+    read_to(dev, clock, alt, limit, &mut SyncSink(out), progress).await
+}
+
+/// [`read`], into an [`AsyncSink`]: the same upload for a frontend whose destination is
+/// itself asynchronous, such as the daemon streaming a reply onto a socket. Every rule
+/// of [`read`] holds, including that a retry happens only while the sink is untouched.
+///
+/// # Errors
+/// As [`read`], with the sink's refusal in place of `out`'s.
+pub async fn read_to<T: LocalUsbTransport, C: Sleeper, S: AsyncSink>(
+    dev: &T,
+    clock: &C,
+    alt: &AltSel,
+    limit: Option<u64>,
+    sink: &mut S,
+    progress: ProgressSink<'_>,
+) -> Result<u64> {
+    let mut output = Output::new(sink, limit);
 
     // The recovery reset, gated on nothing having reached `out`. The gate is the
     // inner `Result`: an `Err` is a failure the helper may answer with a bus reset and
@@ -109,10 +127,10 @@ fn complete_note(total: u64) -> String {
 /// The descriptors are re-read per attempt too, as the C's `dfu_upload_impl` does by
 /// re-entering `tdfu_dfu_read_device` (`dfu.c:979-989`): after a bus reset the previous
 /// `DfuInfo` describes a device that no longer exists.
-async fn one_attempt<T: LocalUsbTransport>(
+async fn one_attempt<T: LocalUsbTransport, S: AsyncSink>(
     dev: &T,
     selection: &AltSel,
-    output: &mut Output<'_>,
+    output: &mut Output<'_, S>,
     progress: ProgressSink<'_>,
 ) -> Result<u64> {
     let info = read_info(dev).await?;
@@ -208,10 +226,10 @@ pub(crate) fn claiming_line(info: &DfuInfo, selection: &AltSel, alt: u8) -> Stri
 /// [`Transaction::first_block_done`], which [`upload_loop`] sets **before** the first
 /// write rather than after it, so a sink that fails on block 0 is never answered by
 /// re-reading the chip.
-async fn transfer<T: LocalUsbTransport>(
+async fn transfer<T: LocalUsbTransport, S: AsyncSink>(
     dev: &T,
     info: &DfuInfo,
-    output: &mut Output<'_>,
+    output: &mut Output<'_, S>,
     progress: ProgressSink<'_>,
 ) -> Result<u64> {
     host::retry_stale_block0(dev, info.interface, progress, async |transaction, progress| {
@@ -234,10 +252,10 @@ async fn transfer<T: LocalUsbTransport>(
 /// blocks — 256 MiB at `wTransferSize` 4096, a T40XP whole-chip read — it wraps back
 /// through 0. Nothing here tests it for 0: that test is the C's bug in all three of its
 /// transfer loops (`dfu.c:602`, `:855`, `:955`).
-async fn upload_loop<T: LocalUsbTransport>(
+async fn upload_loop<T: LocalUsbTransport, S: AsyncSink>(
     dev: &T,
     info: &DfuInfo,
-    output: &mut Output<'_>,
+    output: &mut Output<'_, S>,
     transaction: &Transaction,
     progress: ProgressSink<'_>,
 ) -> Result<u64> {
@@ -270,7 +288,7 @@ async fn upload_loop<T: LocalUsbTransport>(
             // explicit "nothing emitted" fact the block 0 gate is built on — never
             // `block == 0`.
             transaction.first_block_done();
-            output.write(&data)?;
+            output.write(&data).await?;
             progress(Progress::Bytes {
                 phase: Phase::Upload,
                 done: output.written(),
@@ -318,15 +336,15 @@ async fn upload_loop<T: LocalUsbTransport>(
 /// `out` has accepted, and is the count the operation returns; [`touched`](Output::touched)
 /// is whether `out` has been *handed* anything, which becomes true one instant earlier —
 /// before a `write_all` that may fail part-way through.
-struct Output<'a> {
-    out: &'a mut dyn std::io::Write,
+struct Output<'a, S> {
+    out: &'a mut S,
     limit: Option<u64>,
     written: u64,
     touched: bool,
 }
 
-impl<'a> Output<'a> {
-    fn new(out: &'a mut dyn std::io::Write, limit: Option<u64>) -> Self {
+impl<'a, S: AsyncSink> Output<'a, S> {
+    fn new(out: &'a mut S, limit: Option<u64>) -> Self {
         Self {
             out,
             limit,
@@ -364,7 +382,7 @@ impl<'a> Output<'a> {
     ///
     /// # Errors
     /// [`Error::Io`], naming the offset the sink refused at.
-    fn write(&mut self, block: &[u8]) -> Result<()> {
+    async fn write(&mut self, block: &[u8]) -> Result<()> {
         // `saturating_sub` and `get`, not `-` and `[..]`. Both are safe here — the loop
         // only calls this while `!is_full()`, so `written < cap`, and `take` is capped
         // by `block.len()` — but the invariants live in the caller, and a library crate
@@ -387,6 +405,7 @@ impl<'a> Output<'a> {
         self.touched = true;
         self.out
             .write_all(chunk)
+            .await
             .map_err(|cause| write_failed(offset, take, &cause))?;
         self.written = self.written.saturating_add(u64::try_from(take).unwrap_or(u64::MAX));
         Ok(())
@@ -415,13 +434,14 @@ mod tests {
     use tdfu_usb::mock::{Call, MockTransport, Recorded, Reply, block_on};
     use tdfu_usb::{ControlIn, ControlType, DeviceDescriptors, InterfaceSpec, Recipient, pid, vid};
 
-    use super::{complete_note, read};
+    use super::{complete_note, read, read_to};
     use crate::clock::RecordingClock;
     use crate::dfu::descriptors::fixtures::T32LQ_CONFIG;
     use crate::dfu::host::{self, CONTROL_TIMEOUT, DNLOAD_TIMEOUT, POST_RESET_SETTLE};
     use crate::error::Error;
     use crate::model::AltSel;
     use crate::progress::{Phase, Progress};
+    use crate::stream::AsyncSink;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -1931,6 +1951,61 @@ mod tests {
             claiming,
             ["claiming alt 2 on interface 0 (the default: the alt named flash)"]
         );
+        Ok(())
+    }
+
+    /// A collecting async sink with the same bound as [`BoundedSink`], so a read that
+    /// failed to stop fails the test instead of hanging it.
+    #[derive(Debug, Default)]
+    struct Collect {
+        bytes: Vec<u8>,
+    }
+
+    impl AsyncSink for Collect {
+        async fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+            if self.bytes.len() + data.len() > 1 << 20 {
+                return Err(io::Error::other("the read did not stop"));
+            }
+            self.bytes.extend_from_slice(data);
+            Ok(())
+        }
+    }
+
+    /// **`read_to` is `read`.** The same bytes, the same requests, the same progress.
+    #[test]
+    fn a_read_into_an_async_sink_is_the_same_read() -> TestResult {
+        let clock = RecordingClock::new();
+
+        let plain = gadget(10_000);
+        plain.preload(0, pattern(10_000));
+        let mut out = BoundedSink::new();
+        let mut said_plain = Vec::new();
+        let total = block_on(read(
+            &plain,
+            &clock,
+            &AltSel::Default,
+            None,
+            &mut out,
+            &mut record(&mut said_plain),
+        ))?;
+
+        let streamed = gadget(10_000);
+        streamed.preload(0, pattern(10_000));
+        let mut sink = Collect::default();
+        let mut said_streamed = Vec::new();
+        let streamed_total = block_on(read_to(
+            &streamed,
+            &clock,
+            &AltSel::Default,
+            None,
+            &mut sink,
+            &mut record(&mut said_streamed),
+        ))?;
+
+        assert_eq!(streamed_total, total);
+        assert_eq!(sink.bytes, out.bytes, "the same bytes");
+        assert_eq!(streamed.class_requests(), plain.class_requests(), "the same requests");
+        assert_eq!(said_streamed, said_plain, "the same progress");
         Ok(())
     }
 }

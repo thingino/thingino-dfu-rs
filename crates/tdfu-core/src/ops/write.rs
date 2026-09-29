@@ -10,6 +10,7 @@ use crate::dfu::host::{self, Grace};
 use crate::error::{Error, Result};
 use crate::model::{AltSel, DEFAULT_TRANSFER_SIZE, DfuInfo};
 use crate::progress::{Phase, Progress, ProgressSink};
+use crate::stream::AsyncSource;
 
 /// What core says when the manifest has settled and the image is on the flash
 /// (`dfu.c:618`).
@@ -83,14 +84,169 @@ pub async fn write<T: LocalUsbTransport, C: Sleeper>(
     progress: ProgressSink<'_>,
 ) -> Result<()> {
     if image.is_empty() {
-        return Err(Error::Invalid(
-            "the image is empty; there is nothing to write and a zero-length download would report success".into(),
-        ));
+        return Err(empty_image());
     }
+    let mut blocks = SliceBlocks { image, at: 0 };
     host::reset_and_retry_once(dev, clock, progress, async |_attempt, progress| {
-        write_once(dev, clock, alt, image, progress).await
+        write_once(dev, clock, alt, &mut blocks, progress).await
     })
     .await
+}
+
+/// [`write`], with the image read from `source` as it goes out: `len` bytes, and no copy
+/// of them held. The same sequence, retries and progress, with one difference forced by
+/// the stream: **a retry can only happen while nothing past the first block has been
+/// read.** The first block is kept, which is all a stale block 0 or a wedged EP0 at the
+/// start of the transfer needs; past it the bytes are gone, so a failure there is
+/// reported as it is, without the bus reset that could not be followed by a resend. It
+/// is the rule [`read`](super::read) keeps for its sink, in the other direction.
+///
+/// # Errors
+/// As [`write`], plus [`Error::Io`] naming the offset if `source` fails or ends early.
+pub async fn write_from<T: LocalUsbTransport, C: Sleeper, S: AsyncSource>(
+    dev: &T,
+    clock: &C,
+    alt: &AltSel,
+    len: u64,
+    source: &mut S,
+    progress: ProgressSink<'_>,
+) -> Result<()> {
+    if len == 0 {
+        return Err(empty_image());
+    }
+    let mut feed = Feed {
+        source,
+        len,
+        first: Vec::new(),
+        block: Vec::new(),
+        handed: 0,
+        pulled: 0,
+        broken: false,
+    };
+    // The gate `read` uses: an `Err` is a failure the helper may answer with a bus reset
+    // and one more attempt, an `Ok(Err(_))` is already the answer.
+    host::reset_and_retry_once(dev, clock, progress, async |_attempt, progress| {
+        match write_once(dev, clock, alt, &mut feed, progress).await {
+            Err(error) if feed.can_restart() => Err(error),
+            answered => Ok(answered),
+        }
+    })
+    .await?
+}
+
+fn empty_image() -> Error {
+    Error::Invalid(
+        "the image is empty; there is nothing to write and a zero-length download would report success".into(),
+    )
+}
+
+/// Where a download's blocks come from.
+trait Blocks {
+    /// The image's length.
+    fn total(&self) -> u64;
+    /// Go back to the first block for another pass; `false` if that is no longer possible.
+    fn rewind(&mut self) -> bool;
+    /// The next block of at most `size` bytes, or `None` once the image is out.
+    async fn next(&mut self, size: usize) -> Result<Option<&[u8]>>;
+}
+
+/// An image in memory: every pass can start again from the top.
+struct SliceBlocks<'a> {
+    image: &'a [u8],
+    at: usize,
+}
+
+impl Blocks for SliceBlocks<'_> {
+    fn total(&self) -> u64 {
+        as_u64(self.image.len())
+    }
+
+    fn rewind(&mut self) -> bool {
+        self.at = 0;
+        true
+    }
+
+    async fn next(&mut self, size: usize) -> Result<Option<&[u8]>> {
+        let rest = self.image.get(self.at..).unwrap_or_default();
+        if rest.is_empty() {
+            return Ok(None);
+        }
+        let block = rest.get(..size.min(rest.len())).unwrap_or(rest);
+        self.at = self.at.saturating_add(block.len());
+        Ok(Some(block))
+    }
+}
+
+/// A streamed image. It keeps its first block, so a pass can start again only until the
+/// second block has been read.
+struct Feed<'s, S> {
+    source: &'s mut S,
+    len: u64,
+    first: Vec<u8>,
+    block: Vec<u8>,
+    /// Bytes handed out in this pass.
+    handed: u64,
+    /// Bytes ever read from `source`.
+    pulled: u64,
+    /// `source` failed part way through a read, so what it has consumed is unknown.
+    broken: bool,
+}
+
+impl<S: AsyncSource> Feed<'_, S> {
+    fn can_restart(&self) -> bool {
+        !self.broken && self.pulled <= as_u64(self.first.len())
+    }
+
+    async fn pull(&mut self, into_first: bool, offset: u64, take: usize) -> Result<()> {
+        let buf = if into_first { &mut self.first } else { &mut self.block };
+        buf.resize(take, 0);
+        if let Err(cause) = self.source.read_exact(buf).await {
+            self.broken = true;
+            return Err(Error::Io(std::io::Error::new(
+                cause.kind(),
+                format!("reading {take} bytes of the image at offset {offset:#x} from its source: {cause}"),
+            )));
+        }
+        self.pulled = self.pulled.saturating_add(as_u64(take));
+        Ok(())
+    }
+}
+
+impl<S: AsyncSource> Blocks for Feed<'_, S> {
+    fn total(&self) -> u64 {
+        self.len
+    }
+
+    fn rewind(&mut self) -> bool {
+        if !self.can_restart() {
+            return false;
+        }
+        self.handed = 0;
+        true
+    }
+
+    async fn next(&mut self, size: usize) -> Result<Option<&[u8]>> {
+        let left = self.len.saturating_sub(self.handed);
+        if left == 0 {
+            return Ok(None);
+        }
+        let take = usize::try_from(left).map_or(size, |left| left.min(size));
+        if self.handed == 0 {
+            if self.first.is_empty() {
+                self.pull(true, 0, take).await?;
+            } else if self.first.len() != take {
+                return Err(Error::State(format!(
+                    "a restarted streamed write wants {take}-byte blocks, and its first pass kept {}",
+                    self.first.len()
+                )));
+            }
+            self.handed = as_u64(self.first.len());
+            return Ok(Some(&self.first));
+        }
+        self.pull(false, self.handed, take).await?;
+        self.handed = self.handed.saturating_add(as_u64(take));
+        Ok(Some(&self.block))
+    }
 }
 
 /// One whole attempt: info, alt, claim, transfer, release.
@@ -99,11 +255,11 @@ pub async fn write<T: LocalUsbTransport, C: Sleeper>(
 /// the release is on **every** path out — the C leaves that to the
 /// `dfu_close_device` after its call (`dfu.c:974-976`) and so has one exit to get right;
 /// this has several.
-async fn write_once<T: LocalUsbTransport, C: Sleeper>(
+async fn write_once<T: LocalUsbTransport, C: Sleeper, B: Blocks>(
     dev: &T,
     clock: &C,
     alt: &AltSel,
-    image: &[u8],
+    blocks: &mut B,
     progress: ProgressSink<'_>,
 ) -> Result<()> {
     let info = read_info(dev).await?;
@@ -118,7 +274,7 @@ async fn write_once<T: LocalUsbTransport, C: Sleeper>(
         return Err(error);
     }
 
-    let outcome = download(dev, clock, &info, alt, image, progress).await;
+    let outcome = download(dev, clock, &info, alt, blocks, progress).await;
     let released = host::release(dev, info.interface).await;
 
     // The download's failure is the one the operator can act on; a release that also
@@ -140,15 +296,15 @@ pub(crate) fn download_line(alt: u8, bytes: u64, block_size: usize) -> String {
 }
 
 /// The blocks, the end-of-transfer trigger and the manifest, with the interface claimed.
-async fn download<T: LocalUsbTransport, C: Sleeper>(
+async fn download<T: LocalUsbTransport, C: Sleeper, B: Blocks>(
     dev: &T,
     clock: &C,
     info: &DfuInfo,
     alt: u8,
-    image: &[u8],
+    blocks: &mut B,
     progress: ProgressSink<'_>,
 ) -> Result<()> {
-    let total = as_u64(image.len());
+    let total = blocks.total();
     // `read_info` substitutes [`DEFAULT_TRANSFER_SIZE`] for a missing or zero
     // `wTransferSize`, so this is unreachable through it — but `DfuInfo` is
     // public, `chunks(0)` panics, and a flashing tool must not abort mid-write on one.
@@ -159,12 +315,20 @@ async fn download<T: LocalUsbTransport, C: Sleeper>(
         size => size,
     };
 
-    let blocks = host::retry_stale_block0(dev, info.interface, progress, async |transaction, progress| {
+    let sent_blocks = host::retry_stale_block0(dev, info.interface, progress, async |transaction, progress| {
+        // Every pass starts from the first block. `retry_stale_block0` only retries a
+        // failure on block 0, which a stream can still replay; the check is for the case
+        // that would not be.
+        if !blocks.rewind() {
+            return Err(Error::State(
+                "a streamed image cannot be sent again past its first block".to_owned(),
+            ));
+        }
         progress(Progress::Phase(Phase::Download));
         progress(Progress::Debug(download_line(alt, total, block_size)));
         let mut block: u16 = 0;
         let mut done: u64 = 0;
-        for chunk in image.chunks(block_size) {
+        while let Some(chunk) = blocks.next(block_size).await? {
             // Narrated on the way out, as the read's loop does: which block died and how
             // much of the image had landed before it. Both requests count, because a
             // block the device took but never finished flushing fails on the poll.
@@ -202,7 +366,7 @@ async fn download<T: LocalUsbTransport, C: Sleeper>(
 
     // Zero-length `DNLOAD`: end of transfer, and the trigger for the manifest
     // (`dfu.c:613`). It carries the **next** block number, not 0.
-    host::dnload(dev, info.interface, blocks, &[]).await?;
+    host::dnload(dev, info.interface, sent_blocks, &[]).await?;
     // Announced after the device has taken the trigger, because that request is what
     // ends the transfer: the polls that follow carry the device through
     // `dfuDNLOAD-SYNC` and `dfuMANIFEST-SYNC` into `dfuMANIFEST` (`f_dfu.c:445-482`,
@@ -224,13 +388,14 @@ mod tests {
     use tdfu_usb::mock::{Call, MockTransport, Recorded, Reply, block_on};
     use tdfu_usb::{ControlIn, ControlOut, ControlType, DeviceDescriptors, InterfaceSpec, Recipient, pid, vid};
 
-    use super::{COMPLETE_NOTE, write};
+    use super::{COMPLETE_NOTE, write, write_from};
     use crate::clock::RecordingClock;
     use crate::dfu::descriptors::fixtures::SINGLE_ALT_CONFIG;
     use crate::dfu::host::{CONTROL_TIMEOUT, DNLOAD_TIMEOUT, State};
     use crate::error::Error;
     use crate::model::AltSel;
     use crate::progress::{Phase, Progress};
+    use crate::stream::SliceSource;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -881,5 +1046,160 @@ mod tests {
         assert_eq!(device.erases(), 1, "the token armed and the flush ran it");
         assert_eq!(device.alt(), 1);
         Ok(())
+    }
+
+    /// **The streamed write is the slice write.** Same requests in the same order, the same
+    /// progress, the same bytes on the medium, and the source read to its end.
+    #[test]
+    fn a_streamed_write_is_the_slice_write() -> TestResult {
+        let payload = image(200);
+        let clock = RecordingClock::new();
+
+        let sliced = gadget(64);
+        let said_sliced = Said::default();
+        block_on(write(&sliced, &clock, &AltSel::Default, &payload, &mut |step| {
+            said_sliced.0.borrow_mut().push(step);
+        }))?;
+
+        let streamed = gadget(64);
+        let said_streamed = Said::default();
+        let mut source = SliceSource::new(&payload);
+        block_on(write_from(
+            &streamed,
+            &clock,
+            &AltSel::Default,
+            200,
+            &mut source,
+            &mut |step| {
+                said_streamed.0.borrow_mut().push(step);
+            },
+        ))?;
+
+        assert_eq!(streamed.medium(0).ok_or("alt 0 exists")?, payload, "byte for byte");
+        assert_eq!(
+            streamed.events(),
+            sliced.events(),
+            "the same requests, in the same order"
+        );
+        assert_eq!(said_streamed.all(), said_sliced.all(), "the same progress");
+        assert_eq!(source.remaining(), 0, "the source was read to its end");
+        Ok(())
+    }
+
+    /// A stale block 0 is answered from the block the stream kept: the image still lands
+    /// from its first byte, and nothing is read from the source twice.
+    #[test]
+    fn a_streamed_write_replays_a_stale_block_0_from_the_kept_block() -> TestResult {
+        let device = FakeGadget::new(
+            GadgetConfig::t32lq()
+                .with_transfer_size(64)
+                .with_buffer_size(1 << 20)
+                .with_loader(Loader::Legacy),
+        );
+        let clock = RecordingClock::new();
+        let said = Said::default();
+
+        abandon_a_transfer(&device, &clock)?;
+        let resets_before = device.resets();
+
+        let payload = image(100);
+        let mut source = SliceSource::new(&payload);
+        block_on(write_from(
+            &device,
+            &clock,
+            &AltSel::Default,
+            100,
+            &mut source,
+            &mut |step| {
+                said.0.borrow_mut().push(step);
+            },
+        ))?;
+
+        assert_eq!(device.medium(0).ok_or("alt 0 exists")?, payload, "from the first byte");
+        assert_eq!(device.wrong_sequence_refusals(), 1);
+        assert_eq!(device.resets(), resets_before, "the stale retry needs no bus reset");
+        assert_eq!(
+            said.phases(Phase::Download),
+            2,
+            "the restarted pass re-announces itself"
+        );
+        assert_eq!(source.remaining(), 0);
+        Ok(())
+    }
+
+    /// **Past its first block a stream cannot be resent**, so a failure there that a slice
+    /// write would answer with a bus reset and a whole rewrite is reported as it is, with
+    /// no reset that could not be followed by a resend, and the interface released.
+    #[test]
+    fn a_streamed_write_past_block_0_is_not_reset_retried() {
+        let device = gadget(64);
+        let payload = image(200);
+        let clock = RecordingClock::new();
+        let said = Said::default();
+
+        device.inject(When::ClassBlock(request::DNLOAD, 2), Fault::NoDevice);
+
+        let mut source = SliceSource::new(&payload);
+        let outcome = block_on(write_from(
+            &device,
+            &clock,
+            &AltSel::Default,
+            200,
+            &mut source,
+            &mut |step| {
+                said.0.borrow_mut().push(step);
+            },
+        ));
+
+        assert!(matches!(outcome, Err(Error::Usb(_))), "{outcome:?}");
+        assert_eq!(device.resets(), 0, "no reset: the stream is past what it kept");
+        assert!(said.notes().is_empty(), "no retry was announced: {:?}", said.notes());
+        assert_eq!(device.claimed(), None, "released on the failure path");
+    }
+
+    /// A source that ends early fails the write at the offset it ran out at, before that
+    /// block is sent.
+    #[test]
+    fn a_short_source_fails_the_streamed_write_where_it_ends() {
+        let device = gadget(64);
+        let payload = image(100);
+        let clock = RecordingClock::new();
+
+        let mut source = SliceSource::new(&payload);
+        let outcome = block_on(write_from(
+            &device,
+            &clock,
+            &AltSel::Default,
+            200,
+            &mut source,
+            &mut |_| {},
+        ));
+
+        assert!(
+            matches!(&outcome, Err(Error::Io(err)) if err.to_string().contains("at offset 0x40")),
+            "{outcome:?}"
+        );
+        assert_eq!(downloads(&device), [0], "only the block the source could fill went out");
+        assert_eq!(device.claimed(), None);
+    }
+
+    /// An empty streamed image is refused before anything reaches the bus, as a slice's is.
+    #[test]
+    fn an_empty_streamed_image_is_refused() {
+        let device = gadget(64);
+        let clock = RecordingClock::new();
+        let mut source = SliceSource::new(&[]);
+
+        let outcome = block_on(write_from(
+            &device,
+            &clock,
+            &AltSel::Default,
+            0,
+            &mut source,
+            &mut |_| {},
+        ));
+
+        assert!(matches!(outcome, Err(Error::Invalid(_))), "{outcome:?}");
+        assert!(device.events().is_empty(), "nothing was sent to the device");
     }
 }

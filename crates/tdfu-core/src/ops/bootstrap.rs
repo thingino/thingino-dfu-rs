@@ -2,10 +2,11 @@
 
 use tdfu_usb::LocalUsbTransport;
 
-use crate::bootrom::{self, SPL_ENTRY_ADDR, SPL_LOAD_ADDR, UBOOT_ADDR, pad_stage1};
+use crate::bootrom::{self, SPL_ENTRY_ADDR, SPL_LOAD_ADDR, STAGE1_ALIGN, UBOOT_ADDR, pad_stage1};
 use crate::clock::Sleeper;
 use crate::error::Result;
 use crate::progress::{Phase, Progress, ProgressSink};
+use crate::stream::{AsyncSource, Padded, SliceSource};
 
 /// How long to wait after `PROG_STAGE1` before staging U-Boot.
 pub const POST_STAGE1_SETTLE: core::time::Duration = core::time::Duration::from_secs(1);
@@ -88,41 +89,49 @@ pub async fn bootstrap<T: LocalUsbTransport, C: Sleeper>(
     uboot: &[u8],
     progress: ProgressSink<'_>,
 ) -> Result<()> {
-    // Padded: **both** images, before anything reaches the wire, so
-    // that a padding failure cannot happen halfway through a bootstrap.
+    bootstrap_from(dev, clock, stage1, uboot.len(), &mut SliceSource::new(uboot), progress).await
+}
+
+/// [`bootstrap`], with U-Boot read from `uboot` as it goes out: `uboot_len` bytes, padded
+/// on the way through and never held whole. The stage-1 image stays a slice, being a few
+/// tens of kilobytes that are needed before U-Boot has even started to arrive.
+///
+/// # Errors
+/// As [`bootstrap`], plus [`Error::Io`](crate::Error::Io) if `uboot` fails or ends early. A stream that
+/// fails part way leaves the bootrom holding a partial U-Boot it was never told to run;
+/// a power cycle starts over.
+pub async fn bootstrap_from<T: LocalUsbTransport, C: Sleeper, S: AsyncSource>(
+    dev: &T,
+    clock: &C,
+    stage1: &[u8],
+    uboot_len: usize,
+    uboot: &mut S,
+    progress: ProgressSink<'_>,
+) -> Result<()> {
+    // Padded before anything reaches the wire, so a padding step cannot fail halfway
+    // through a bootstrap; U-Boot's zeros are added as its bytes stream past.
     let stage1 = pad_stage1(stage1);
-    let uboot = pad_stage1(uboot);
+    let uboot_padded = uboot_len.next_multiple_of(STAGE1_ALIGN);
 
     progress(Progress::Phase(Phase::Stage1));
-    // The C's `dfu.c:1131` and `:1142`, after the phase rather than before it: the phase
-    // opens the step and this is its detail. The size is the padded one, which is what
-    // actually crosses the bus, and the addresses are the two that decide
-    // whether a bootstrap can work at all.
     progress(Progress::Debug(format!(
         "stage 1: {} bytes to {SPL_LOAD_ADDR:#010x}, entered at {SPL_ENTRY_ADDR:#010x}",
         stage1.len()
     )));
     bootrom::load_to_memory(dev, clock, SPL_LOAD_ADDR, &stage1, &mut *progress).await?;
-    // No FLUSH_CACHE here. The stage-1 image may be executing out of
-    // cache-as-RAM on a capped XBurst1, so flushing before it runs could invalidate it.
     bootrom::prog_stage1(dev, clock, SPL_ENTRY_ADDR).await?;
 
-    // Stage 1 brings up clock and DDR and returns to the bootrom. U-Boot
-    // DMA'd in before that completes lands in uninitialised DDR (`dfu.c:1139-1140`).
     clock.sleep(POST_STAGE1_SETTLE).await;
 
     progress(Progress::Phase(Phase::UBoot));
     progress(Progress::Debug(format!(
-        "U-Boot: {} bytes to {UBOOT_ADDR:#010x}",
-        uboot.len()
+        "U-Boot: {uboot_padded} bytes to {UBOOT_ADDR:#010x}"
     )));
-    bootrom::load_to_memory(dev, clock, UBOOT_ADDR, &uboot, &mut *progress).await?;
+    let mut padded = Padded::new(uboot, uboot_len);
+    bootrom::load_from(dev, clock, UBOOT_ADDR, uboot_padded, &mut padded, &mut *progress).await?;
 
-    // Fatal, and PROG_STAGE2 is not sent after it.
     bootrom::flush_cache(dev, clock).await?;
-    // Any failure here *is* success — the device has already jumped.
-    // `prog_stage2` swallows it, so this `?` is the shape of its siblings and nothing
-    // more.
+    // `prog_stage2` swallows its errors: the device is already executing U-Boot.
     bootrom::prog_stage2(dev, clock, UBOOT_ADDR).await?;
 
     progress(Progress::Note(STARTING_NOTE.to_owned()));

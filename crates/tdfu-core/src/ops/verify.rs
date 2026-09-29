@@ -10,6 +10,7 @@ use crate::dfu::host;
 use crate::error::{Error, Result};
 use crate::model::{AltSel, DEFAULT_TRANSFER_SIZE, DfuInfo};
 use crate::progress::{Phase, Progress, ProgressSink};
+use crate::stream::AsyncSink;
 
 /// What core says when the read-back matched, with the byte count (`dfu.c:961`).
 ///
@@ -92,10 +93,133 @@ pub async fn verify<T: LocalUsbTransport, C: Sleeper>(
             "the image is empty; there is nothing to compare against".into(),
         ));
     }
+    let mut check = AgainstImage(image);
     host::reset_and_retry_once(dev, clock, progress, async |_attempt, progress| {
-        verify_once(dev, alt, image, progress).await
+        verify_once(dev, alt, as_u64(image.len()), &mut check, progress).await
     })
     .await
+}
+
+/// [`verify`]'s read-back without its comparison: `len` bytes of `alt` are handed to
+/// `read_back`, and the caller decides whether they match. For a frontend that no longer
+/// holds the image, such as the daemon after a streamed write, which compares a CRC.
+///
+/// The read-back itself is [`verify`]'s: the same [`Phase::Verify`] progress, the same
+/// early-end rule, the same close-out. There is no completion note, since only the
+/// caller knows the verdict, and a retry happens only while `read_back` has been handed
+/// nothing, so a CRC it keeps never counts a byte twice.
+///
+/// # Errors
+/// [`Error::Invalid`] if `len` is zero, [`Error::Protocol`] if the alt ends before `len`
+/// bytes, [`Error::Io`] if `read_back` refuses a block, or the transport's error.
+pub async fn verify_with<T: LocalUsbTransport, C: Sleeper, S: AsyncSink>(
+    dev: &T,
+    clock: &C,
+    alt: &AltSel,
+    len: u64,
+    read_back: &mut S,
+    progress: ProgressSink<'_>,
+) -> Result<()> {
+    if len == 0 {
+        return Err(Error::Invalid(
+            "the image is empty; there is nothing to compare against".into(),
+        ));
+    }
+    let mut check = IntoSink {
+        sink: read_back,
+        touched: false,
+    };
+    // `read`'s gate: an `Err` may be answered with a bus reset and one more attempt, an
+    // `Ok(Err(_))` is already the answer.
+    host::reset_and_retry_once(dev, clock, progress, async |_attempt, progress| {
+        match verify_once(dev, alt, len, &mut check, progress).await {
+            Err(error) if !check.touched => Err(error),
+            answered => Ok(answered),
+        }
+    })
+    .await?
+}
+
+/// What each read-back block is held against.
+trait Check {
+    /// `read_back` is the next block, starting `offset` bytes in; an error ends the verify.
+    async fn check(&mut self, offset: u64, read_back: &[u8]) -> Result<()>;
+    /// The alt ended at `offset`, before the length being verified.
+    fn ended_early(&self, offset: u64) -> Error;
+    /// What to announce once every byte has been checked.
+    fn note(&self, total: u64) -> Option<String>;
+}
+
+/// Byte for byte against an image in memory: what [`verify`] has always done.
+struct AgainstImage<'a>(&'a [u8]);
+
+impl Check for AgainstImage<'_> {
+    async fn check(&mut self, offset: u64, read_back: &[u8]) -> Result<()> {
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        let Some(expected) = self.0.get(start..start.saturating_add(read_back.len())) else {
+            return Err(Error::Protocol(format!(
+                "the verify cursor left the image: {} bytes at offset {start} of {}",
+                read_back.len(),
+                self.0.len()
+            )));
+        };
+        if let Some(index) = first_difference(read_back, expected) {
+            let at = start.saturating_add(index);
+            return Err(Error::Verify {
+                offset: as_u64(at),
+                expected: self.0.get(at).copied().unwrap_or_default(),
+                actual: read_back.get(index).copied(),
+            });
+        }
+        Ok(())
+    }
+
+    fn ended_early(&self, offset: u64) -> Error {
+        // A short device answer is a Verify failure with no read-back byte, not
+        // generic invalid input - the offset can then ride
+        // `tdfu_proto::verify_failed_message` on the daemon wire.
+        let at = usize::try_from(offset).unwrap_or(usize::MAX);
+        Error::Verify {
+            offset,
+            expected: self.0.get(at).copied().unwrap_or_default(),
+            actual: None,
+        }
+    }
+
+    fn note(&self, total: u64) -> Option<String> {
+        Some(matched_note(total))
+    }
+}
+
+/// Into a sink, for a caller that holds the expectation itself.
+struct IntoSink<'s, S> {
+    sink: &'s mut S,
+    touched: bool,
+}
+
+impl<S: AsyncSink> Check for IntoSink<'_, S> {
+    async fn check(&mut self, offset: u64, read_back: &[u8]) -> Result<()> {
+        self.touched = true;
+        self.sink.write_all(read_back).await.map_err(|cause| {
+            Error::Io(std::io::Error::new(
+                cause.kind(),
+                format!(
+                    "handing on {} read-back bytes at offset {offset:#x}: {cause}",
+                    read_back.len()
+                ),
+            ))
+        })
+    }
+
+    fn ended_early(&self, offset: u64) -> Error {
+        Error::Protocol(format!(
+            "the read-back ended at {offset} bytes, short of the length being verified"
+        ))
+    }
+
+    fn note(&self, _total: u64) -> Option<String> {
+        None
+    }
 }
 
 /// One whole attempt: info, alt, claim, compare, release.
@@ -103,10 +227,11 @@ pub async fn verify<T: LocalUsbTransport, C: Sleeper>(
 /// No clock: an upload is never polled, so nothing here sleeps. A vestigial parameter is
 /// a smell applied to ourselves here — `make_idle` and `retry_stale_block0` shed
 /// theirs for the same reason.
-async fn verify_once<T: LocalUsbTransport>(
+async fn verify_once<T: LocalUsbTransport, K: Check>(
     dev: &T,
     alt: &AltSel,
-    image: &[u8],
+    len: u64,
+    check: &mut K,
     progress: ProgressSink<'_>,
 ) -> Result<()> {
     let info = read_info(dev).await?;
@@ -121,7 +246,7 @@ async fn verify_once<T: LocalUsbTransport>(
         return Err(error);
     }
 
-    let outcome = compare(dev, &info, image, progress).await;
+    let outcome = compare(dev, &info, len, check, progress).await;
     let released = host::release(dev, info.interface).await;
 
     // The comparison's failure is the one the operator can act on; a release that also
@@ -133,13 +258,13 @@ async fn verify_once<T: LocalUsbTransport>(
 }
 
 /// The upload loop and the comparison, with the interface claimed.
-async fn compare<T: LocalUsbTransport>(
+async fn compare<T: LocalUsbTransport, K: Check>(
     dev: &T,
     info: &DfuInfo,
-    image: &[u8],
+    len: u64,
+    check: &mut K,
     progress: ProgressSink<'_>,
 ) -> Result<()> {
-    let total = as_u64(image.len());
     // As in `write`: unreachable through `read_info`, which substitutes for a missing or
     // zero `wTransferSize`, but `DfuInfo` is public and a zero-length
     // `UPLOAD` would be answered for ever.
@@ -151,11 +276,11 @@ async fn compare<T: LocalUsbTransport>(
     let left_open = host::retry_stale_block0(dev, info.interface, progress, async |transaction, progress| {
         progress(Progress::Phase(Phase::Verify));
         let mut block: u16 = 0;
-        let mut done: usize = 0;
+        let mut done: u64 = 0;
         // Whether the device's last answer left its read transaction open, which a full
         // block does and a short one does not.
         let mut left_open = false;
-        while done < image.len() {
+        while done < len {
             // Narrated on the way out (`dfu.c:926`): which block died and how much had
             // already compared equal. A verify that fails at the same offset every run is
             // a bad chip; one that fails at a different offset each time is a bad link,
@@ -174,49 +299,24 @@ async fn compare<T: LocalUsbTransport>(
             // same rule as the extra `r == TDFU_ERROR_VERIFY` term at `dfu.c:955`.
             transaction.first_block_done();
 
-            // Checked rather than trusted. `done < image.len()` is the loop condition
-            // and `compared <= chunk.len()` follows from the `min`, so both of these
-            // hold — but they hold because of a condition several lines away, and an
-            // edit that moved the cursor would turn a wrong answer into a panic in a
-            // library crate. `saturating_sub` and `get` cost nothing
-            // and make the invariant local.
-            let want = image.len().saturating_sub(done);
-            let compared = chunk.len().min(want);
-            let (Some(read_back), Some(expected)) =
-                (chunk.get(..compared), image.get(done..done.saturating_add(compared)))
-            else {
-                return Err(Error::Protocol(format!(
-                    "the verify cursor left the image: {compared} bytes at offset {done} of {}",
-                    image.len()
-                )));
-            };
-            if let Some(offset) = first_difference(read_back, expected) {
-                let at = done.saturating_add(offset);
-                return Err(Error::Verify {
-                    offset: as_u64(at),
-                    expected: image.get(at).copied().unwrap_or_default(),
-                    actual: chunk.get(offset).copied(),
-                });
-            }
-            done += compared;
+            // `min` against what is left, and `get` rather than `[..]`: the invariant is
+            // local, and a library crate does not get to abort on one.
+            let want = len.saturating_sub(done);
+            let compared = usize::try_from(want).map_or(chunk.len(), |want| chunk.len().min(want));
+            let read_back = chunk.get(..compared).unwrap_or_default();
+            check.check(done, read_back).await?;
+            done = done.saturating_add(as_u64(compared));
             block = block.wrapping_add(1);
             progress(Progress::Bytes {
                 phase: Phase::Verify,
-                done: as_u64(done),
-                total: Some(total),
+                done,
+                total: Some(len),
             });
 
             // A short answer is how an upload ends (`dfu.c:945`). Past the image length
             // it is the expected ending; before it, the medium ran out first.
-            if chunk.len() < usize::from(block_size) && done < image.len() {
-                // A short device answer is a Verify failure with no read-back byte, not
-                // generic invalid input - the offset can then ride
-                // `tdfu_proto::verify_failed_message` on the daemon wire.
-                return Err(Error::Verify {
-                    offset: as_u64(done),
-                    expected: image.get(done).copied().unwrap_or_default(),
-                    actual: None,
-                });
+            if chunk.len() < usize::from(block_size) && done < len {
+                return Err(check.ended_early(done));
             }
             left_open = chunk.len() >= usize::from(block_size);
         }
@@ -236,7 +336,9 @@ async fn compare<T: LocalUsbTransport>(
         drop(host::abort(dev, info.interface).await);
     }
 
-    progress(Progress::Note(matched_note(total)));
+    if let Some(note) = check.note(len) {
+        progress(Progress::Note(note));
+    }
     Ok(())
 }
 
@@ -256,7 +358,7 @@ mod tests {
     use tdfu_usb::mock::{Call, MockTransport, Recorded, Reply, block_on};
     use tdfu_usb::{ControlIn, ControlType, DeviceDescriptors, InterfaceSpec, Recipient, pid, vid};
 
-    use super::{matched_note, verify};
+    use super::{matched_note, verify, verify_with};
     use crate::clock::RecordingClock;
     use crate::dfu::descriptors::fixtures::SINGLE_ALT_CONFIG;
     use crate::dfu::host::{CONTROL_TIMEOUT, State};
@@ -264,6 +366,7 @@ mod tests {
     use crate::model::AltSel;
     use crate::ops::write;
     use crate::progress::{Phase, Progress};
+    use crate::stream::AsyncSink;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -851,6 +954,54 @@ mod tests {
         assert_eq!(device.entity_inited(0), Some(false), "the transaction was closed");
         assert_eq!(device.entity_sequence(0), Some(0), "and its counter is back at 0");
         assert_eq!(device.claimed(), None, "and the interface was released after it");
+        Ok(())
+    }
+
+    /// Hands every read-back byte on, unchecked.
+    #[derive(Debug, Default)]
+    struct Collect(Vec<u8>);
+
+    impl AsyncSink for Collect {
+        async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+            self.0.extend_from_slice(data);
+            Ok(())
+        }
+    }
+
+    /// `verify_with` reads back exactly `len` bytes of the alt, under the verify phase,
+    /// and leaves the verdict (and so the completion note) to its caller.
+    #[test]
+    fn verify_with_hands_on_exactly_the_length_and_says_no_verdict() -> TestResult {
+        let device = gadget(10_000);
+        let image: Vec<u8> = (0..10_000_usize)
+            .map(|at| u8::try_from(at % 251).unwrap_or(0))
+            .collect();
+        device.preload(0, image.clone());
+        let clock = RecordingClock::new();
+        let mut said = Vec::new();
+        let mut read_back = Collect::default();
+
+        block_on(verify_with(
+            &device,
+            &clock,
+            &AltSel::Default,
+            6_000,
+            &mut read_back,
+            &mut |step| {
+                said.push(step);
+            },
+        ))?;
+
+        assert_eq!(
+            read_back.0,
+            image.get(..6_000).ok_or("image")?,
+            "exactly the length asked for"
+        );
+        assert!(said.contains(&Progress::Phase(Phase::Verify)));
+        assert!(
+            !said.iter().any(|step| matches!(step, Progress::Note(_))),
+            "no verdict from a read-back that compared nothing: {said:?}"
+        );
         Ok(())
     }
 }

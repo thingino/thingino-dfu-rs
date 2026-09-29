@@ -34,6 +34,7 @@ pub mod loader;
 pub mod model;
 pub mod ops;
 pub mod progress;
+pub mod stream;
 
 pub use error::{Error, Result};
 pub use model::{

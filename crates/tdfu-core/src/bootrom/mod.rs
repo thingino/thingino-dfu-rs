@@ -34,7 +34,7 @@ mod fixtures;
 mod transfer;
 mod vendor;
 
-pub use transfer::{load_to_memory, read_memory};
+pub use transfer::{load_from, load_to_memory, read_memory};
 pub use vendor::{flush_cache, get_cpu_info, prog_stage1, prog_stage2, set_data_addr, set_data_len};
 
 use core::time::Duration;

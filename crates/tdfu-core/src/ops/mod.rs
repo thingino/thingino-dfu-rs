@@ -42,15 +42,15 @@ mod reboot;
 mod verify;
 mod write;
 
-pub use bootstrap::{POST_STAGE1_SETTLE, bootstrap};
+pub use bootstrap::{POST_STAGE1_SETTLE, bootstrap, bootstrap_from};
 pub use detect::detect;
 pub use diag::diag;
 pub use erase::erase;
 pub use probe::{probe, probe_with_progress};
-pub use read::read;
+pub use read::{read, read_to};
 pub use reboot::reboot;
-pub use verify::verify;
-pub use write::write;
+pub use verify::{verify, verify_with};
+pub use write::{write, write_from};
 
 pub use crate::dfu::descriptors::classify;
 pub use crate::model::Stage;

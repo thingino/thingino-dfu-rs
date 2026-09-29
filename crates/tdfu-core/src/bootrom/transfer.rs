@@ -6,6 +6,7 @@ use crate::addr::Kseg1;
 use crate::clock::Sleeper;
 use crate::error::{Error, Result};
 use crate::progress::{Phase, Progress, ProgressSink};
+use crate::stream::AsyncSource;
 
 use super::{
     BULK_CHUNK, CHUNK_ATTEMPTS, CHUNK_RETRY_DELAY, INTER_CHUNK_DELAY, INTER_CHUNK_DELAY_THRESHOLD, READ_MEMORY_TIMEOUT,
@@ -91,7 +92,7 @@ pub async fn load_to_memory<T: LocalUsbTransport, C: Sleeper>(
     // The C claims here, after the two vendor requests and before the first chunk
     // (`bootstrap.c:77-86`), and releases on every path out (`:151`, `:158`, `:173`).
     claim(dev).await?;
-    let transferred = transfer_chunks(dev, clock, addr, data, progress).await;
+    let transferred = transfer_chunks(dev, clock, addr, data.len(), &mut FromSlice(data), progress).await;
     // On the T20 a still-claimed interface makes the FLUSH_CACHE and
     // PROG_STAGE2 that follow time out. The transfer's error outranks a release
     // failure, but neither is dropped.
@@ -100,26 +101,109 @@ pub async fn load_to_memory<T: LocalUsbTransport, C: Sleeper>(
     released
 }
 
-/// The chunk loop of [`load_to_memory`], with the claim already in force.
-async fn transfer_chunks<T: LocalUsbTransport, C: Sleeper>(
+/// [`load_to_memory`], with the image read from `source` as it goes out: `len` bytes,
+/// no more than one [`BULK_CHUNK`] of them held at a time. The same requests, chunks,
+/// retries and delays, so the bootrom sees the same traffic either way.
+///
+/// **The caller pads**, exactly as for [`load_to_memory`]: `len` is what `SET_DATA_LEN`
+/// carries. Wrap the source in [`Padded`](crate::stream::Padded) for the rounding
+/// [`pad_stage1`](super::pad_stage1) does to a slice.
+///
+/// # Errors
+/// As [`load_to_memory`], plus [`Error::Io`] naming the range if `source` fails or ends
+/// early.
+pub async fn load_from<T: LocalUsbTransport, C: Sleeper, S: AsyncSource>(
     dev: &T,
     clock: &C,
     addr: u32,
-    data: &[u8],
+    len: usize,
+    source: &mut S,
+    progress: ProgressSink<'_>,
+) -> Result<()> {
+    if len == 0 {
+        return Err(Error::Invalid(format!("nothing to stage at {addr:#010X}")));
+    }
+    let wire_len =
+        u32::try_from(len).map_err(|_| Error::Invalid(format!("{len} bytes is more than the bootrom can stage")))?;
+
+    set_data_addr(dev, clock, addr).await?;
+    set_data_len(dev, clock, wire_len).await?;
+
+    claim(dev).await?;
+    let mut chunks = FromSource {
+        source,
+        buf: Vec::new(),
+    };
+    let transferred = transfer_chunks(dev, clock, addr, len, &mut chunks, progress).await;
+    // As in `load_to_memory`: released on every path, the transfer's error first.
+    let released = release(dev).await;
+    transferred?;
+    released
+}
+
+/// Where the chunk loop takes each chunk from.
+trait Chunks {
+    /// Bytes `start..end` of the image. Called once per chunk, in order.
+    async fn chunk(&mut self, start: usize, end: usize) -> Result<&[u8]>;
+}
+
+/// An image in memory.
+struct FromSlice<'a>(&'a [u8]);
+
+impl Chunks for FromSlice<'_> {
+    async fn chunk(&mut self, start: usize, end: usize) -> Result<&[u8]> {
+        self.0.get(start..end).ok_or_else(|| {
+            Error::Protocol(format!(
+                "chunk {start}..{end} is outside the {}-byte image",
+                self.0.len()
+            ))
+        })
+    }
+}
+
+/// A streamed image, one chunk held at a time.
+struct FromSource<'s, S> {
+    source: &'s mut S,
+    buf: Vec<u8>,
+}
+
+impl<S: AsyncSource> Chunks for FromSource<'_, S> {
+    async fn chunk(&mut self, start: usize, end: usize) -> Result<&[u8]> {
+        self.buf.resize(end.saturating_sub(start), 0);
+        self.source.read_exact(&mut self.buf).await.map_err(|cause| {
+            Error::Io(std::io::Error::new(
+                cause.kind(),
+                format!("reading bytes {start:#x}..{end:#x} of the image from its source: {cause}"),
+            ))
+        })?;
+        Ok(&self.buf)
+    }
+}
+
+/// The chunk loop of [`load_to_memory`] and [`load_from`], with the claim already in
+/// force.
+async fn transfer_chunks<T: LocalUsbTransport, C: Sleeper, K: Chunks>(
+    dev: &T,
+    clock: &C,
+    addr: u32,
+    total: usize,
+    chunks: &mut K,
     progress: ProgressSink<'_>,
 ) -> Result<()> {
     let phase = phase_for(addr);
-    let total = data.len();
     let mut offset = 0_usize;
 
     while offset < total {
+        let chunk_start = offset;
         let chunk_end = total.min(offset + BULK_CHUNK);
+        let data = chunks.chunk(chunk_start, chunk_end).await?;
         // The C never resets this budget, so three partial writes in a row
         // fail a chunk that made progress every time. Progress resets it here.
         let mut attempts_left = CHUNK_ATTEMPTS;
 
         while offset < chunk_end {
-            let Some(chunk) = data.get(offset..chunk_end) else {
+            // What is left of this chunk after any partial writes.
+            let Some(chunk) = data.get(offset.saturating_sub(chunk_start)..) else {
                 return Err(Error::Protocol(format!(
                     "chunk {offset}..{chunk_end} is outside the {total}-byte image"
                 )));
@@ -242,6 +326,7 @@ mod tests {
     };
     use crate::clock::RecordingClock;
     use crate::progress::{Phase, Progress};
+    use crate::stream::SliceSource;
     use tdfu_usb::mock::{Call, MockTransport, Reply, block_on};
     use tdfu_usb::{Pipe, UsbError, UsbErrorKind, endpoint};
 
@@ -727,5 +812,48 @@ mod tests {
         assert_eq!(phase_for(0x8020_0000), Phase::Unknown);
         assert_eq!(Phase::Stage1.wire_byte(), 1);
         assert_eq!(Phase::UBoot.wire_byte(), 2);
+    }
+
+    /// **A streamed load is the slice load**: the same requests, chunks and delays for an
+    /// image that spans two chunks and crosses the delay threshold.
+    #[test]
+    fn a_streamed_load_is_the_slice_load() -> TestResult {
+        let data = image(INTER_CHUNK_DELAY_THRESHOLD + 1);
+
+        let clock_slice = RecordingClock::new();
+        let dev = staging(
+            MockTransport::new(bootrom()).configured(CONFIGURATION),
+            UBOOT_ADDR,
+            &data,
+        );
+        block_on(load_to_memory(
+            &dev,
+            &clock_slice,
+            UBOOT_ADDR,
+            &data,
+            &mut crate::progress::sink_ignore(),
+        ))?;
+        dev.verify()?;
+
+        let clock_stream = RecordingClock::new();
+        let dev = staging(
+            MockTransport::new(bootrom()).configured(CONFIGURATION),
+            UBOOT_ADDR,
+            &data,
+        );
+        let mut source = SliceSource::new(&data);
+        block_on(super::load_from(
+            &dev,
+            &clock_stream,
+            UBOOT_ADDR,
+            data.len(),
+            &mut source,
+            &mut crate::progress::sink_ignore(),
+        ))?;
+        dev.verify()?;
+
+        assert_eq!(clock_stream.slept(), clock_slice.slept(), "the same delays");
+        assert_eq!(source.remaining(), 0);
+        Ok(())
     }
 }
