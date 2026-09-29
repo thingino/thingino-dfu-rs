@@ -21,6 +21,14 @@
 //! through `DISCOVER` would republish the caller's guess as this daemon's finding —
 //! which is exactly the shape the device list removes from the C. Only a
 //! [`Detection::Resolved`] is remembered.
+//!
+//! # A loader pair can stream
+//!
+//! A daemon that holds no loaders is sent them with the request, and one that cannot
+//! hold U-Boot either ([`streamed`]) sends it to the bootrom as it arrives. The SPL is
+//! held whole: a few tens of kilobytes, needed before U-Boot has started to arrive.
+
+use core::cmp::Ordering;
 
 use tdfu_core::clock::Sleeper;
 use tdfu_core::model::{Detection, Variant};
@@ -28,7 +36,8 @@ use tdfu_core::{Error, loader, ops};
 use tdfu_proto::{Blobs, Command};
 use tdfu_usb::LocalUsbBackend;
 
-use super::report::{Queue, pump};
+use super::fields::{Fields, Refusal};
+use super::report::{Intake, Io, Queue, pump, pump_with};
 use super::state::{Activity, DaemonState, Identity, Port};
 use super::{Reply, Wire, device, variant_field};
 use crate::errors::{DaemonError, wire_message};
@@ -53,57 +62,15 @@ where
     let busy = state.busy(Activity::Bootstrapping);
     debug_assert_eq!(busy.activity(), Activity::Bootstrapping);
 
-    // The one command that keeps the refusal: `resolve_images` turns this name
-    // into `firmware/dfu/<variant>/…`, so a name with no loader directory is refused here
-    // rather than as a missing file.
-    let requested = match variant_field(Command::Bootstrap, variant) {
-        Ok(requested) => requested,
-        Err(error) => return Ok(Reply::Error(wire_message(&error))),
-    };
-
-    let row = match state.row(index) {
-        Ok(row) => row.clone(),
-        Err(error) => return Ok(Reply::failed("bootstrap", &error)),
-    };
-    let selected = match device::select(&state.backend, index, &row).await {
-        Ok(selected) => selected,
-        Err(error) => return Ok(Reply::failed("bootstrap", &error)),
-    };
-    // An audit's finding, on the daemon side. The gadget and the bootrom
-    // share `a108:c309`, so a device the descriptors cannot classify is
-    // genuinely unknown, and uploading a stage-1 image to one may be uploading it to a
-    // device that is mid-flash. The C checks nothing here.
-    //
-    // It takes the `"bootstrap failed: <class>: <detail>"` shape, which is the point:
-    // it used to be a hand-built `format!` with no operation prefix, so one
-    // command answered in two shapes for no stated reason. The rule, and it is the C's
-    // own split: a refusal **of the payload** is bare, because the C's are
-    // (`"payload too short"` `dfu-remote/main.c:360`, `"bad variant length"` `:368`,
-    // `"bad SPL override"` `:386`); everything that goes wrong **after the payload
-    // parsed**, on the way to or during the work, is `"bootstrap failed: %s"` (`:438`).
-    // This check is the second kind. `parse_variant`'s refusal above is the first, and
-    // stays bare.
-    if !selected.is_bootrom() {
-        return Ok(Reply::failed(
-            "bootstrap",
-            &Error::Invalid(format!(
-                "device {index} is {}, and only a device in the bootrom can be bootstrapped",
-                selected.describe()
-            )),
-        ));
-    }
-    let port = Port::of(&selected.descriptors);
-    let identity = Identity::of(&selected.descriptors);
-
-    let device = match state.backend.open(&selected.id).await {
-        Ok(device) => device,
-        Err(error) => return Ok(Reply::failed("bootstrap", &Error::from(error))),
+    let opened = match open(state, index, variant).await {
+        Ok(opened) => opened,
+        Err(reply) => return Ok(reply),
     };
 
     // Detection runs only when it has to. Custom blobs skip it *and* the firmware-dir
     // lookup: the caller has said which images to send, so asking the
     // device what it is would spend three transfers to answer a question nobody asked.
-    let chosen = match resolve_images(state, &device, requested, blobs).await {
+    let chosen = match resolve_images(state, &opened.device, opened.requested, blobs).await {
         Ok(chosen) => chosen,
         Err(error) => return Ok(Reply::failed("bootstrap", &error)),
     };
@@ -131,11 +98,143 @@ where
             conn,
             Command::Bootstrap,
             &queue,
-            ops::bootstrap(&device, &state.clock, &stage1, &uboot, &mut sink),
+            ops::bootstrap(&opened.device, &state.clock, &stage1, &uboot, &mut sink),
         )
         .await?
     };
 
+    Ok(finish(state, index, &opened, detected, outcome))
+}
+
+/// A streamed `BOOTSTRAP`: the loader pair arrives with the request, and U-Boot goes to
+/// the bootrom as it does.
+///
+/// The fields are read with [`Request::decode`](tdfu_proto::Request::decode)'s checks
+/// ([`Fields`]), and every length is checked against the payload before the device is
+/// touched, as decoding a whole payload first does. After that it is [`handle`] with a
+/// caller's pair: no detection, nothing remembered for the port.
+///
+/// # Errors
+/// [`DaemonError`] only if the connection failed.
+pub async fn streamed<W, B, C>(conn: &mut W, state: &mut DaemonState<B, C>, len: u64) -> Result<Reply, DaemonError>
+where
+    W: Wire,
+    B: LocalUsbBackend,
+    C: Sleeper,
+{
+    let pair = match Pair::read(conn, len, state.stream_above).await {
+        Ok(pair) => pair,
+        Err(Refusal::Payload(message)) => return Ok(Reply::Error(message.to_owned())),
+        Err(Refusal::Conn(error)) => return Err(error),
+    };
+    let Some((stage1, uboot_len)) = pair.images else {
+        // No pair: the whole request was its first two fields.
+        return handle(conn, state, pair.index, &pair.variant, None).await;
+    };
+
+    state.arm();
+    let _busy = state.busy(Activity::Bootstrapping);
+    let opened = match open(state, pair.index, &pair.variant).await {
+        Ok(opened) => opened,
+        Err(reply) => return Ok(reply),
+    };
+
+    let intake = Intake::new();
+    let queue = Queue::new();
+    let outcome = {
+        let mut sink = queue.sink();
+        let mut source = intake.source();
+        let io = Io {
+            intake: Some(&intake),
+            outbox: None,
+        };
+        pump_with(
+            conn,
+            Command::Bootstrap,
+            &queue,
+            io,
+            ops::bootstrap_from(&opened.device, &state.clock, &stage1, uboot_len, &mut source, &mut sink),
+        )
+        .await?
+    };
+    Ok(finish(state, pair.index, &opened, None, outcome))
+}
+
+/// A bootrom, checked and opened.
+struct Opened<T> {
+    device: T,
+    port: Port,
+    identity: Identity,
+    /// The variant the caller named, if any.
+    requested: Option<Variant>,
+}
+
+/// What both handlers check before an image moves, then the device, opened. The `Err`
+/// is the answer.
+async fn open<B, C>(state: &DaemonState<B, C>, index: u8, variant: &[u8]) -> Result<Opened<B::Transport>, Reply>
+where
+    B: LocalUsbBackend,
+    C: Sleeper,
+{
+    // The one command that keeps the refusal: `resolve_images` turns this name
+    // into `firmware/dfu/<variant>/…`, so a name with no loader directory is refused here
+    // rather than as a missing file.
+    let requested = variant_field(Command::Bootstrap, variant).map_err(|error| Reply::Error(wire_message(&error)))?;
+
+    let row = state
+        .row(index)
+        .map_err(|error| Reply::failed("bootstrap", &error))?
+        .clone();
+    let selected = device::select(&state.backend, index, &row)
+        .await
+        .map_err(|error| Reply::failed("bootstrap", &error))?;
+    // An audit's finding, on the daemon side. The gadget and the bootrom
+    // share `a108:c309`, so a device the descriptors cannot classify is
+    // genuinely unknown, and uploading a stage-1 image to one may be uploading it to a
+    // device that is mid-flash. The C checks nothing here.
+    //
+    // It takes the `"bootstrap failed: <class>: <detail>"` shape, which is the point:
+    // it used to be a hand-built `format!` with no operation prefix, so one
+    // command answered in two shapes for no stated reason. The rule, and it is the C's
+    // own split: a refusal **of the payload** is bare, because the C's are
+    // (`"payload too short"` `dfu-remote/main.c:360`, `"bad variant length"` `:368`,
+    // `"bad SPL override"` `:386`); everything that goes wrong **after the payload
+    // parsed**, on the way to or during the work, is `"bootstrap failed: %s"` (`:438`).
+    // This check is the second kind. `parse_variant`'s refusal above is the first, and
+    // stays bare.
+    if !selected.is_bootrom() {
+        return Err(Reply::failed(
+            "bootstrap",
+            &Error::Invalid(format!(
+                "device {index} is {}, and only a device in the bootrom can be bootstrapped",
+                selected.describe()
+            )),
+        ));
+    }
+    let port = Port::of(&selected.descriptors);
+    let identity = Identity::of(&selected.descriptors);
+
+    let device = state
+        .backend
+        .open(&selected.id)
+        .await
+        .map_err(|error| Reply::failed("bootstrap", &Error::from(error)))?;
+    Ok(Opened {
+        device,
+        port,
+        identity,
+        requested,
+    })
+}
+
+/// What a bootstrap that ran comes to.
+fn finish<B, C, T>(
+    state: &mut DaemonState<B, C>,
+    index: u8,
+    opened: &Opened<T>,
+    detected: Option<Variant>,
+    outcome: Result<(), Error>,
+) -> Reply {
     match outcome {
         Ok(()) => {
             // The device is on its way back as a DFU gadget with a new device number,
@@ -144,12 +243,61 @@ where
             // read this, so neither has to accept "a gadget turned up somewhere near".
             state.expect_gadget_at(index);
             if let Some(variant) = detected {
-                state.variants.put(&port, identity, true, variant);
-                tracing::debug!(?variant, port = %port.describe(), "remembered the detected SoC for this port");
+                state.variants.put(&opened.port, opened.identity, true, variant);
+                tracing::debug!(?variant, port = %opened.port.describe(), "remembered the detected SoC for this port");
             }
-            Ok(Reply::ok())
+            Reply::ok()
         }
-        Err(error) => Ok(Reply::failed("bootstrap", &error)),
+        Err(error) => Reply::failed("bootstrap", &error),
+    }
+}
+
+/// A streamed `BOOTSTRAP`'s fields: the device, the variant, and the loader pair's
+/// stage-1 image with U-Boot's length, U-Boot itself being the rest of the payload.
+struct Pair {
+    index: u8,
+    variant: Vec<u8>,
+    images: Option<(Vec<u8>, usize)>,
+}
+
+impl Pair {
+    /// `[idx][vlen][variant]`, then `[spl_len][spl][uboot_len]` up to U-Boot, refused as
+    /// [`Request::decode`](tdfu_proto::Request::decode) refuses it. A stage-1 image over
+    /// `hold` bytes is refused before a byte of it is read.
+    async fn read<W: Wire>(conn: &mut W, len: u64, hold: Option<u32>) -> Result<Self, Refusal> {
+        let mut fields = Fields::new(len);
+        let (index, variant) = fields.index_and_variant(conn).await?;
+        if fields.left() == 0 {
+            return Ok(Self {
+                index,
+                variant,
+                images: None,
+            });
+        }
+        let spl_len = fields.be32(conn, "bad SPL override length").await?;
+        if spl_len == 0 || u64::from(spl_len) > fields.left() {
+            return Err(Refusal::Payload("bad SPL override"));
+        }
+        if hold.is_some_and(|hold| spl_len > hold) {
+            return Err(Refusal::Payload("the SPL override is larger than this daemon can hold"));
+        }
+        let spl_len = usize::try_from(spl_len).map_err(|_| Refusal::Payload("bad SPL override"))?;
+        let stage1 = fields.bytes(conn, spl_len, "bad SPL override").await?;
+        let uboot_len = fields.be32(conn, "bad U-Boot override length").await?;
+        if uboot_len == 0 {
+            return Err(Refusal::Payload("bad U-Boot override"));
+        }
+        match fields.left().cmp(&u64::from(uboot_len)) {
+            Ordering::Less => return Err(Refusal::Payload("bad U-Boot override")),
+            Ordering::Greater => return Err(Refusal::Payload("trailing bytes")),
+            Ordering::Equal => {}
+        }
+        let uboot_len = usize::try_from(uboot_len).map_err(|_| Refusal::Payload("bad U-Boot override"))?;
+        Ok(Self {
+            index,
+            variant,
+            images: Some((stage1, uboot_len)),
+        })
     }
 }
 
@@ -323,8 +471,9 @@ where
 #[cfg(test)]
 mod tests {
 
+    use crate::commands::Wire as _;
     use crate::commands::fake::{FakeBackend, LoopbackConn, Scratch, Sent, TestResult, t23_regs};
-    use crate::commands::fake::{dispatch, seen};
+    use crate::commands::fake::{dispatch, dispatch_streamed, seen};
     use crate::commands::state::Window;
     use crate::commands::state::{Activity, DaemonState, Identity, Port};
     use tdfu_core::clock::RecordingClock;
@@ -847,6 +996,164 @@ mod tests {
             "{:?}",
             conn.log_lines()
         );
+        Ok(())
+    }
+
+    // ------------------------------------------------------------ streamed
+
+    fn pattern(len: u32) -> Vec<u8> {
+        (0..len).map(|at| (at % 251) as u8).collect()
+    }
+
+    fn pair(spl: &[u8], uboot: &[u8]) -> Result<Vec<u8>, tdfu_proto::ProtoError> {
+        Request::Bootstrap {
+            index: 0,
+            variant: Vec::new(),
+            blobs: Some(Blobs {
+                spl: spl.to_vec(),
+                uboot: uboot.to_vec(),
+            }),
+        }
+        .encode()
+    }
+
+    /// **A streamed pair reaches the bootrom as a whole one does**: the same uploads, in
+    /// the same chunks, which the scripted bootrom checks request by request. U-Boot is
+    /// over two bootrom chunks here, so it crosses a chunk boundary while streaming.
+    #[test]
+    fn a_streamed_bootstrap_sends_the_pair_it_was_given() -> TestResult {
+        let (spl, uboot) = (pattern(3000), pattern(150_000));
+        let backend = FakeBackend::new(vec![FakeBackend::bootstrappable_bootrom(spl.clone(), uboot.clone())]);
+        // The limit is also the most the daemon holds, and the stage-1 image is held.
+        let mut state = daemon(backend, std::path::Path::new("/nonexistent-firmware-dir")).with_stream_above(4096);
+        block_on(seen(&mut state))?;
+        let mut conn = LoopbackConn::raw();
+        block_on(dispatch_streamed(
+            &mut conn,
+            &mut state,
+            Command::Bootstrap,
+            &pair(&spl, &uboot)?,
+        ))?;
+        assert_eq!(
+            conn.response(),
+            Some((Status::Ok, b"OK".to_vec())),
+            "{:?}",
+            conn.error_text()
+        );
+        assert_eq!(conn.drained(), 0, "the handler read the whole payload itself");
+        assert_eq!(state.activity(), Activity::Idle);
+        Ok(())
+    }
+
+    /// **Every malformed layout is refused as the decoder refuses it**, in the same
+    /// words, before the bus is touched.
+    #[test]
+    fn a_streamed_bootstrap_refuses_what_the_decoder_refuses() -> TestResult {
+        let good = pair(b"stage-1", b"u-boot")?;
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("payload too short", vec![0]),
+            ("bad variant length", vec![0, 9, 1, 2]),
+            ("bad SPL override length", vec![0, 0, 0, 0]),
+            ("bad SPL override", vec![0, 0, 0, 0, 0, 0]),
+            ("bad SPL override", [&[0_u8, 0, 0, 0, 0, 10][..], &[0; 5]].concat()),
+            ("bad U-Boot override length", vec![0, 0, 0, 0, 0, 1, 0xAA, 0, 0]),
+            ("bad U-Boot override", vec![0, 0, 0, 0, 0, 1, 0xAA, 0, 0, 0, 0]),
+            ("bad U-Boot override", vec![0, 0, 0, 0, 0, 1, 0xAA, 0, 0, 0, 9, 1, 2, 3]),
+            ("trailing bytes", [&good[..], &[0]].concat()),
+        ];
+        for (words, payload) in cases {
+            let root = std::path::Path::new("/nonexistent-firmware-dir");
+            let mut whole = LoopbackConn::raw();
+            let mut state = daemon(FakeBackend::new(vec![FakeBackend::bootrom(t23_regs())]), root);
+            block_on(seen(&mut state))?;
+            block_on(dispatch(&mut whole, &mut state, Command::Bootstrap, &payload))?;
+            assert_eq!(whole.error_text().as_deref(), Some(words), "read whole");
+
+            let mut streamed = LoopbackConn::raw();
+            // Enough to hold every stage-1 image here, so the layout is what is refused.
+            let mut state =
+                daemon(FakeBackend::new(vec![FakeBackend::bootrom(t23_regs())]), root).with_stream_above(64);
+            block_on(seen(&mut state))?;
+            block_on(dispatch_streamed(
+                &mut streamed,
+                &mut state,
+                Command::Bootstrap,
+                &payload,
+            ))?;
+            assert_eq!(streamed.error_text().as_deref(), Some(words), "streamed");
+            assert!(state.backend.opened().is_empty(), "{words}: the bus was touched");
+            assert_eq!(streamed.payload_left(), 0, "{words}: the rest was not read");
+        }
+        Ok(())
+    }
+
+    /// The stage-1 image is held whole, so one bigger than the daemon holds is refused
+    /// before a byte of it is read, and the rest of the request is read and dropped.
+    #[test]
+    fn a_stage1_image_larger_than_the_daemon_holds_is_refused() -> TestResult {
+        let root = std::path::Path::new("/nonexistent-firmware-dir");
+        let mut state = daemon(FakeBackend::new(vec![FakeBackend::bootrom(t23_regs())]), root).with_stream_above(1024);
+        block_on(seen(&mut state))?;
+        let mut conn = LoopbackConn::raw();
+        let payload = pair(&pattern(2000), &pattern(5000))?;
+        block_on(dispatch_streamed(&mut conn, &mut state, Command::Bootstrap, &payload))?;
+        assert_eq!(
+            conn.error_text().as_deref(),
+            Some("the SPL override is larger than this daemon can hold")
+        );
+        assert!(state.backend.opened().is_empty());
+        assert_eq!(conn.drained(), payload.len() - 6, "everything after the SPL length");
+        Ok(())
+    }
+
+    /// A streamed request that carries no pair is the ordinary bootstrap, detection and
+    /// the loader tree and all.
+    #[test]
+    fn a_streamed_bootstrap_without_a_pair_is_the_ordinary_one() -> TestResult {
+        let scratch = Scratch::new("bootstrap-streamed-plain")?;
+        scratch.loader_tree(Variant::T23n)?;
+        let backend = FakeBackend::new(vec![FakeBackend::detectable_bootstrappable_bootrom(
+            t23_regs(),
+            b"stage-1".to_vec(),
+            b"u-boot".to_vec(),
+        )]);
+        let mut state = daemon(backend, scratch.root()).with_stream_above(0);
+        block_on(seen(&mut state))?;
+        let mut conn = LoopbackConn::raw();
+        block_on(dispatch_streamed(&mut conn, &mut state, Command::Bootstrap, &[0, 0]))?;
+        assert_eq!(
+            conn.response(),
+            Some((Status::Ok, b"OK".to_vec())),
+            "{:?}",
+            conn.error_text()
+        );
+        Ok(())
+    }
+
+    /// The checks before an image moves are the whole request's: a device that is not
+    /// in the bootrom is refused in the same words, and U-Boot is never read.
+    #[test]
+    fn a_streamed_bootstrap_to_a_gadget_is_refused_as_a_whole_one_is() -> TestResult {
+        let root = std::path::Path::new("/nonexistent-firmware-dir");
+        let payload = pair(&pattern(3000), &pattern(20_000))?;
+
+        let mut whole = LoopbackConn::raw();
+        let mut state = daemon(FakeBackend::new(vec![FakeBackend::gadget()]), root);
+        block_on(seen(&mut state))?;
+        block_on(dispatch(&mut whole, &mut state, Command::Bootstrap, &payload))?;
+        let expected = whole.error_text().ok_or("a gadget cannot be bootstrapped")?;
+
+        let mut streamed = LoopbackConn::raw();
+        let mut state = daemon(FakeBackend::new(vec![FakeBackend::gadget()]), root).with_stream_above(4096);
+        block_on(seen(&mut state))?;
+        block_on(dispatch_streamed(
+            &mut streamed,
+            &mut state,
+            Command::Bootstrap,
+            &payload,
+        ))?;
+        assert_eq!(streamed.error_text(), Some(expected));
+        assert_eq!(streamed.drained(), 20_000, "U-Boot was skipped, not sent");
         Ok(())
     }
 }

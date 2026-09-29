@@ -43,9 +43,9 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::auth::Auth;
 use crate::commands::state::DaemonState;
 use crate::commands::{self, Wire};
-use crate::transport::{Conn, DaemonError, Origins, Timeouts};
+use crate::transport::{Conn, DaemonError, Incoming, Origins, Timeouts};
 
-/// The four methods `dispatch` consumes, forwarded to the real connection one to one.
+/// The methods `dispatch` consumes, forwarded to the real connection one to one.
 ///
 /// `commands::Wire` is a trait rather than `Conn` itself so the commands are tested
 /// against a loopback double with no socket (`commands::fake::LoopbackConn`); this is
@@ -82,6 +82,26 @@ impl Wire for Conn {
 
     fn logs_enabled_for(&self, cmd: Command) -> bool {
         Conn::logs_enabled_for(self, cmd)
+    }
+
+    async fn payload(&mut self, buf: &mut [u8]) -> Result<(), DaemonError> {
+        Conn::payload(self, buf).await
+    }
+
+    fn payload_left(&self) -> u64 {
+        Conn::payload_left(self)
+    }
+
+    async fn begin_reply(&mut self, status: Status, len: u64) -> Result<(), DaemonError> {
+        Conn::begin_reply(self, status, len).await
+    }
+
+    async fn reply_body(&mut self, bytes: &[u8]) -> Result<(), DaemonError> {
+        Conn::reply_body(self, bytes).await
+    }
+
+    async fn end_reply(&mut self) -> Result<(), DaemonError> {
+        Conn::end_reply(self).await
     }
 }
 
@@ -224,15 +244,15 @@ where
     loop {
         // The C's `while (g_running)`, checked between commands (`main.c:888-892`).
         let request = tokio::select! {
-            request = conn.next_request() => request?,
+            request = conn.next_incoming(state.stream_above) => request?,
             () = signals.next() => return Ok(Ending::Stopped),
         };
-        let Some((command, payload)) = request else {
+        let Some(request) = request else {
             return Ok(Ending::Done);
         };
         // The ask for narration is connection state, not an operation: it is answered
         // here, and every command after it on this connection carries the narration.
-        if command == Command::Debug {
+        if let Incoming::Whole(Command::Debug, _) = request {
             conn.set_narration(true);
             conn.respond(Status::Ok, &[]).await?;
             if conn.one_shot() {
@@ -240,7 +260,7 @@ where
             }
             continue;
         }
-        if dispatch_to_its_end(&mut conn, state, command, &payload, signals).await? == Ending::Stopped {
+        if dispatch_to_its_end(&mut conn, state, request, signals).await? == Ending::Stopped {
             return Ok(Ending::Stopped);
         }
         if conn.one_shot() {
@@ -258,8 +278,7 @@ where
 async fn dispatch_to_its_end<B, C, S>(
     conn: &mut Conn,
     state: &mut DaemonState<B, C>,
-    command: Command,
-    payload: &[u8],
+    request: Incoming,
     signals: &mut S,
 ) -> Result<Ending, DaemonError>
 where
@@ -267,7 +286,15 @@ where
     C: Sleeper,
     S: Signals,
 {
-    let mut dispatching = pin!(commands::dispatch(conn, state, command, payload));
+    let command = match &request {
+        Incoming::Whole(command, _) | Incoming::Streamed(command, _) => *command,
+    };
+    let mut dispatching = pin!(async {
+        match request {
+            Incoming::Whole(command, payload) => commands::dispatch(conn, state, command, &payload).await,
+            Incoming::Streamed(command, len) => commands::dispatch_streamed(conn, state, command, len).await,
+        }
+    });
     let mut signalled = false;
     loop {
         tokio::select! {
@@ -306,7 +333,7 @@ mod tests {
     use crate::auth::Auth;
     use crate::clock::TokioClock;
     use crate::commands::fake::{FakeBackend, TestResult};
-    use crate::commands::state::DaemonState;
+    use crate::commands::state::{DaemonState, ReadStaging};
     use crate::transport::{Origins, Timeouts};
 
     /// What a client half of a test hands back through `join!`.
@@ -922,6 +949,72 @@ mod tests {
         assert_eq!(kinds.last(), Some(&Status::Ok), "{kinds:?}");
         assert!(kinds.contains(&Status::Log), "the logs still arrive: {kinds:?}");
         assert!(!narration.is_empty(), "no RESP_DEBUG arrived: {kinds:?}");
+        Ok(())
+    }
+
+    /// **A streaming daemon, end to end over a real socket**: a `WRITE` over the limit
+    /// streams into the gadget and verifies, the connection is still in step for the
+    /// next request, and a `READ` with no staging file brings the image back.
+    #[tokio::test]
+    async fn a_streaming_daemon_writes_and_reads_back_on_one_connection() -> TestResult {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let auth = Auth::open();
+        let mut state = DaemonState::new(FakeBackend::new(vec![FakeBackend::gadget()]), TokioClock, "firmware")
+            .with_stream_above(1024)
+            .with_read_staging(ReadStaging::TwoPass);
+        let image: Vec<u8> = (0..20_000_u32).map(|at| (at % 251) as u8).collect();
+        let (stop, stops) = stops();
+
+        let server = serve(listener, &auth, Timeouts::DEFAULT, shipped(), &mut state, stops);
+        let client = async {
+            let mut stream = TcpStream::connect(address).await?;
+            stream.write_all(&frame_of(&Request::Discover)?).await?;
+            let (listed, _) = one_frame(&mut stream).await?;
+            let write = Request::Write {
+                index: 0,
+                variant: Vec::new(),
+                alt: b"flash".to_vec(),
+                image: image.clone(),
+                crc32: tdfu_proto::crc32(&image),
+                verify: Some(true),
+            };
+            stream.write_all(&frame_of(&write)?).await?;
+            let written = final_frame(&mut stream).await?;
+            let status = status_of(&mut stream).await?;
+            let read = Request::Read {
+                index: 0,
+                variant: Vec::new(),
+                alt: Some(b"flash".to_vec()),
+            };
+            stream.write_all(&frame_of(&read)?).await?;
+            let read = final_frame(&mut stream).await?;
+            drop(stream);
+            let _ignored = stop.send(());
+            Ok::<_, Box<dyn std::error::Error>>((listed, written, status, read))
+        };
+        let (stopped, outcome) = tokio::join!(bounded(server), client);
+        stopped?;
+        let (listed, written, status, read) = outcome?;
+        assert_eq!(listed, Status::Ok);
+        let (written, reply, _, bars) = written.ok_or("the write was not answered")?;
+        assert_eq!(
+            (written, reply.as_slice()),
+            (Status::Ok, &b"OK"[..]),
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
+        assert!(bars > 0, "the write reported progress");
+        assert_eq!(
+            status,
+            (Status::Ok, b"idle".to_vec()),
+            "the connection is still in step"
+        );
+        let (read, payload, _, _) = read.ok_or("the read was not answered")?;
+        assert_eq!(read, Status::Ok);
+        let (data, crc) = payload.split_at(payload.len().saturating_sub(4));
+        assert_eq!(data.get(..image.len()), Some(image.as_slice()));
+        assert_eq!(crc, tdfu_proto::crc32(data).to_be_bytes());
         Ok(())
     }
 }

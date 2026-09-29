@@ -23,6 +23,7 @@ pub mod bootstrap;
 pub mod device;
 pub mod diag;
 pub mod discover;
+pub mod fields;
 pub mod read;
 pub mod reboot;
 pub mod report;
@@ -82,6 +83,37 @@ pub trait Wire {
 
     /// Does this transport emit log and progress frames for this command?
     fn logs_enabled_for(&self, cmd: Command) -> bool;
+
+    /// The next `buf.len()` bytes of a streamed request's payload
+    /// ([`dispatch_streamed`]).
+    ///
+    /// # Errors
+    /// [`DaemonError`] past the payload's end, or when the connection failed.
+    async fn payload(&mut self, buf: &mut [u8]) -> Result<(), DaemonError>;
+
+    /// Bytes of a streamed request's payload not yet read; zero for a payload read whole.
+    fn payload_left(&self) -> u64;
+
+    /// Open the final OK/ERROR frame with a payload of `len` bytes, which follow through
+    /// [`reply_body`](Wire::reply_body); [`end_reply`](Wire::end_reply) closes it. A
+    /// streamed payload's unread rest is read and dropped first, as
+    /// [`respond`](Wire::respond) does.
+    ///
+    /// # Errors
+    /// [`DaemonError`] for a length the frame cannot carry, or when the connection failed.
+    async fn begin_reply(&mut self, status: Status, len: u64) -> Result<(), DaemonError>;
+
+    /// More of the reply [`begin_reply`](Wire::begin_reply) opened.
+    ///
+    /// # Errors
+    /// [`DaemonError`] past the announced length, or when the connection failed.
+    async fn reply_body(&mut self, bytes: &[u8]) -> Result<(), DaemonError>;
+
+    /// Close the reply [`begin_reply`](Wire::begin_reply) opened.
+    ///
+    /// # Errors
+    /// [`DaemonError`] short of the announced length, or when the connection failed.
+    async fn end_reply(&mut self) -> Result<(), DaemonError>;
 }
 
 /// What a handler decided, before it reaches the wire.
@@ -95,10 +127,14 @@ pub trait Wire {
 pub enum Reply {
     /// A success payload subject to the 64 MiB cap.
     Ok(Vec<u8>),
-    /// `CMD_READ`'s success payload, which may exceed the cap.
+    /// A success payload exempt from the cap, as only `CMD_READ`'s may be. `READ` itself
+    /// streams its reply ([`Reply::Sent`]) so that no copy of the image is held.
     Bulk(Vec<u8>),
     /// A `RESP_ERROR` payload: UTF-8, not NUL-terminated.
     Error(String),
+    /// The handler answered already, with a reply it streamed
+    /// ([`Wire::begin_reply`]).
+    Sent,
 }
 
 impl Reply {
@@ -157,6 +193,69 @@ where
         "a command left the daemon busy; see commands::state::Busy"
     );
     respond(conn, reply).await
+}
+
+/// Run one request whose payload is still on the socket, and answer it.
+///
+/// `WRITE` and `BOOTSTRAP` carry images, and read them from the connection as they go to
+/// the device ([`write::streamed`], [`bootstrap::streamed`]). Nothing any other command
+/// carries comes near a size worth streaming, so the rest are refused. Whatever a command
+/// leaves unread is read and dropped before its final frame ([`Wire::respond`]), so the
+/// peer's send completes and the next request starts where it should.
+///
+/// # Errors
+/// As [`dispatch`].
+pub async fn dispatch_streamed<W, B, C>(
+    conn: &mut W,
+    state: &mut DaemonState<B, C>,
+    cmd: Command,
+    len: u64,
+) -> Result<(), DaemonError>
+where
+    W: Wire,
+    B: LocalUsbBackend,
+    C: Sleeper,
+{
+    let reply = match cmd {
+        Command::Write => write::streamed(conn, state, len).await?,
+        Command::Bootstrap => bootstrap::streamed(conn, state, len).await?,
+        _ => Reply::Error("payload too large".to_owned()),
+    };
+    debug_assert_eq!(
+        state.activity(),
+        Activity::Idle,
+        "a command left the daemon busy; see commands::state::Busy"
+    );
+    respond(conn, reply).await
+}
+
+/// A streamed request that turned out small enough to hold after all: `head` is what
+/// was read of it, the rest is read now, and the whole is decoded and run as though it
+/// had arrived whole.
+async fn run_whole<W, B, C>(
+    conn: &mut W,
+    state: &mut DaemonState<B, C>,
+    cmd: Command,
+    head: Vec<u8>,
+) -> Result<Reply, DaemonError>
+where
+    W: Wire,
+    B: LocalUsbBackend,
+    C: Sleeper,
+{
+    let mut payload = head;
+    let at = payload.len();
+    let rest = usize::try_from(conn.payload_left()).map_err(|_| DaemonError::Stream("a payload too large to hold"))?;
+    payload.resize(at.saturating_add(rest), 0);
+    if let Some(tail) = payload.get_mut(at..) {
+        conn.payload(tail).await?;
+    }
+    match Request::decode(cmd, &payload) {
+        Ok(request) => run(conn, state, request).await,
+        Err(error) => Ok(Reply::Error(
+            error.wire_message().unwrap_or("payload too short").to_owned(),
+        )),
+    }
 }
 
 async fn run<W, B, C>(conn: &mut W, state: &mut DaemonState<B, C>, request: Request) -> Result<Reply, DaemonError>
@@ -238,6 +337,7 @@ async fn respond<W: Wire>(conn: &mut W, reply: Reply) -> Result<(), DaemonError>
         }
         Reply::Bulk(payload) => conn.respond(Status::Ok, &payload).await,
         Reply::Error(message) => conn.respond(Status::Error, message.as_bytes()).await,
+        Reply::Sent => Ok(()),
     }
 }
 
@@ -377,7 +477,7 @@ pub const fn claims_state(command: Command) -> Option<Activity> {
 mod tests {
     use super::{Reply, claims_state, parse_alt, parse_variant};
     use crate::commands::fake::{FakeBackend, LoopbackConn, Sent, TestResult};
-    use crate::commands::fake::{dispatch, seen};
+    use crate::commands::fake::{dispatch, dispatch_streamed, seen};
     use crate::commands::state::{Activity, DaemonState};
     use tdfu_core::model::{AltSel, Variant};
     use tdfu_core::{Error, clock::RecordingClock};
@@ -696,5 +796,25 @@ mod tests {
                 "write failed: Device not found: no DFU interface: is the device in U-Boot DFU mode?".to_owned()
             )
         );
+    }
+
+    /// Only `WRITE` and `BOOTSTRAP` carry images. Any other command with a payload over
+    /// the limit is refused, and the payload is read and dropped so the connection stays
+    /// in step.
+    #[test]
+    fn a_streamed_payload_on_another_command_is_refused() -> TestResult {
+        for command in [Command::Read, Command::Discover, Command::Diag, Command::Debug] {
+            let mut conn = LoopbackConn::raw();
+            let mut state = daemon(FakeBackend::empty()).with_stream_above(16);
+            block_on(dispatch_streamed(&mut conn, &mut state, command, &[0; 5000]))?;
+            assert_eq!(
+                conn.sent(),
+                vec![Sent::Response(Status::Error, b"payload too large".to_vec())],
+                "{command:?}"
+            );
+            assert_eq!(conn.drained(), 5000, "{command:?}");
+            assert_eq!(state.activity(), Activity::Idle);
+        }
+        Ok(())
     }
 }

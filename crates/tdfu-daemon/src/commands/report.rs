@@ -21,15 +21,26 @@
 //! between polls, returning `Pending` only when the future is pending **and** the queue
 //! is empty — so the future's own waker still drives the loop and nothing spins. The
 //! frames go out interleaved, in order, exactly as they were emitted.
+//!
+//! # A payload or a reply too large to hold
+//!
+//! [`pump_with`] is the same loop for an operation that also reads a streamed request
+//! payload ([`Intake`]) or writes a streamed reply ([`Outbox`]). The operation cannot use
+//! the connection itself, because the pump holds it to send the progress; so it leaves
+//! what it wants with the pump, and the pump, the connection's one user, does the reading
+//! and the writing between polls.
 
+use core::cell::Cell;
 use core::future::{Future, poll_fn};
 use core::pin::pin;
 use core::task::Poll;
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::io;
 
 use tdfu_core::progress::Progress;
-use tdfu_proto::{Command, ProgressBody};
+use tdfu_core::stream::{AsyncSink, AsyncSource};
+use tdfu_proto::{Command, HEADER_LEN, ProgressBody};
 
 use super::Wire;
 use crate::errors::DaemonError;
@@ -73,6 +84,270 @@ impl Queue {
     }
 }
 
+/// The most an operation is handed from a streamed payload in one step, whatever it asks
+/// for at once: a bootrom chunk is 64 KiB, and a daemon on a microcontroller should hold
+/// that chunk once, not twice.
+const INTAKE_STEP: usize = 4 * 1024;
+
+/// How much of a streamed reply an operation may leave before it waits for the pump.
+const OUTBOX_CAPACITY: usize = 4 * 1024;
+
+/// A streamed request payload, read by [`pump_with`] on an operation's behalf.
+///
+/// The operation's [`IntakeSource`] says how many bytes it wants and waits; the pump,
+/// seeing that, reads them from the connection and polls the operation again.
+#[derive(Debug, Default)]
+pub struct Intake {
+    /// Bytes the operation is waiting for; zero while it is not.
+    wanted: Cell<usize>,
+    /// The bytes read for it.
+    ready: RefCell<Vec<u8>>,
+}
+
+impl Intake {
+    /// Nothing asked for yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The source to hand the operation.
+    #[must_use]
+    pub const fn source(&self) -> IntakeSource<'_> {
+        IntakeSource { intake: self }
+    }
+
+    /// Read what the operation is waiting for.
+    async fn serve<W: Wire>(&self, conn: &mut W) -> Result<(), DaemonError> {
+        let wanted = self.wanted.get();
+        if wanted == 0 {
+            return Ok(());
+        }
+        let mut ready = core::mem::take(&mut *self.ready.borrow_mut());
+        ready.resize(wanted, 0);
+        conn.payload(&mut ready).await?;
+        *self.ready.borrow_mut() = ready;
+        self.wanted.set(0);
+        Ok(())
+    }
+}
+
+/// An [`Intake`] as the operation reads it.
+#[derive(Debug)]
+pub struct IntakeSource<'a> {
+    intake: &'a Intake,
+}
+
+impl AsyncSource for IntakeSource<'_> {
+    async fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        for piece in buf.chunks_mut(INTAKE_STEP) {
+            self.intake.wanted.set(piece.len());
+            // No waker is kept: the pump is the only thing that can answer, and it polls
+            // the operation again as soon as it has.
+            poll_fn(|_| {
+                if self.intake.wanted.get() == 0 {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            let ready = self.intake.ready.borrow();
+            let Some(bytes) = ready.get(..piece.len()) else {
+                return Err(io::Error::other("the request payload came back short"));
+            };
+            piece.copy_from_slice(bytes);
+        }
+        Ok(())
+    }
+}
+
+/// A streamed reply, written by [`pump_with`] on an operation's behalf: [`Intake`] in the
+/// other direction. The operation's [`OutboxSink`] fills it and waits while it is full;
+/// the pump empties it onto the connection ([`Wire::reply_body`]).
+#[derive(Debug, Default)]
+pub struct Outbox {
+    held: RefCell<Vec<u8>>,
+}
+
+impl Outbox {
+    /// Empty.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The sink to hand the operation.
+    #[must_use]
+    pub const fn sink(&self) -> OutboxSink<'_> {
+        OutboxSink { outbox: self }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.held.borrow().is_empty()
+    }
+
+    /// Write out what the operation left.
+    async fn serve<W: Wire>(&self, conn: &mut W) -> Result<(), DaemonError> {
+        let mut held = core::mem::take(&mut *self.held.borrow_mut());
+        if !held.is_empty() {
+            conn.reply_body(&held).await?;
+        }
+        held.clear();
+        *self.held.borrow_mut() = held;
+        Ok(())
+    }
+}
+
+/// An [`Outbox`] as the operation writes it.
+#[derive(Debug)]
+pub struct OutboxSink<'a> {
+    outbox: &'a Outbox,
+}
+
+impl AsyncSink for OutboxSink<'_> {
+    async fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        let mut rest = data;
+        while !rest.is_empty() {
+            // As for the intake: the pump empties it and polls again.
+            poll_fn(|_| {
+                if self.outbox.held.borrow().len() < OUTBOX_CAPACITY {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            let mut held = self.outbox.held.borrow_mut();
+            let room = OUTBOX_CAPACITY.saturating_sub(held.len()).min(rest.len());
+            let (now, later) = rest.split_at(room);
+            held.extend_from_slice(now);
+            rest = later;
+        }
+        Ok(())
+    }
+}
+
+/// The streams an operation reads and writes through [`pump_with`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Io<'a> {
+    /// The request payload it reads.
+    pub intake: Option<&'a Intake>,
+    /// The reply it writes.
+    pub outbox: Option<&'a Outbox>,
+}
+
+impl Io<'_> {
+    /// Neither.
+    pub const NONE: Self = Self {
+        intake: None,
+        outbox: None,
+    };
+
+    /// Is the operation waiting on the pump?
+    fn has_work(&self) -> bool {
+        self.intake.is_some_and(|intake| intake.wanted.get() > 0)
+            || self.outbox.is_some_and(|outbox| !outbox.is_empty())
+    }
+
+    async fn serve<W: Wire>(&self, conn: &mut W) -> Result<(), DaemonError> {
+        if let Some(intake) = self.intake {
+            intake.serve(conn).await?;
+        }
+        if let Some(outbox) = self.outbox {
+            outbox.serve(conn).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Everything sent while a streamed request is still arriving stays under this.
+const INTAKE_FRAME_BUDGET: usize = 16 * 1024;
+
+/// While a request is still arriving, one byte-count frame per this much of the total.
+const INTAKE_BYTES_STEPS: u64 = 100;
+
+/// ... and never more often than this many bytes apart.
+const INTAKE_BYTES_FLOOR: u64 = 64 * 1024;
+
+/// What goes out while a streamed request is still arriving: little.
+///
+/// A client may read nothing until it has sent its whole request; a browser's `fetch`
+/// does not look at the response before the body is up. Every frame sent meanwhile waits
+/// in the client's receive buffer, and once that is full the daemon's writes block, so
+/// it stops reading the payload, so the client's writes block too, and neither side
+/// moves again. So while the payload is still coming, byte counts are thinned to about
+/// [`INTAKE_BYTES_STEPS`] per phase and everything together stays under
+/// [`INTAKE_FRAME_BUDGET`], far below any receive window. Narration past the budget is
+/// counted rather than sent, and the count goes out once the payload is in.
+#[derive(Debug, Default)]
+struct Thinning {
+    /// Frame bytes sent while the payload was arriving.
+    spent: usize,
+    /// The stage and byte count of the last byte-count frame sent meanwhile.
+    last: Option<(u8, u64)>,
+    /// Narration lines held back.
+    held_back: usize,
+}
+
+impl Thinning {
+    async fn offer<W: Wire>(&mut self, conn: &mut W, progress: &Progress) -> Result<(), DaemonError> {
+        if conn.payload_left() == 0 {
+            self.settle(conn).await?;
+            return send(conn, progress).await;
+        }
+        if let Progress::Bytes { phase, done, total } = progress {
+            let step = total.map_or(INTAKE_BYTES_FLOOR, |total| {
+                (total / INTAKE_BYTES_STEPS).max(INTAKE_BYTES_FLOOR)
+            });
+            let since = self
+                .last
+                .filter(|(stage, _)| *stage == phase.wire_byte())
+                .map(|(_, last)| done.saturating_sub(last));
+            if since.is_some_and(|since| since < step) && Some(*done) != *total {
+                return Ok(());
+            }
+        }
+        let size = frame_size(progress);
+        if self.spent.saturating_add(size) > INTAKE_FRAME_BUDGET {
+            if let Progress::Debug(line) = progress {
+                tracing::debug!("{line}");
+                self.held_back += 1;
+            }
+            return Ok(());
+        }
+        self.spent += size;
+        if let Progress::Bytes { phase, done, .. } = progress {
+            self.last = Some((phase.wire_byte(), *done));
+        }
+        send(conn, progress).await
+    }
+
+    /// Own up to the narration held back, once the payload is in.
+    async fn settle<W: Wire>(&mut self, conn: &mut W) -> Result<(), DaemonError> {
+        if self.held_back > 0 && conn.payload_left() == 0 {
+            let count = core::mem::take(&mut self.held_back);
+            conn.debug(&format!(
+                "{count} narration lines were not sent while the request was still arriving"
+            ))
+            .await?;
+        }
+        Ok(())
+    }
+}
+
+/// About how many bytes `progress` takes on the wire: its frame, an HTTP chunk's framing
+/// around it, and its payload.
+fn frame_size(progress: &Progress) -> usize {
+    const FRAMING: usize = HEADER_LEN + 16;
+    FRAMING
+        + match progress {
+            Progress::Note(line) | Progress::Debug(line) => line.len() + 1,
+            // A progress body is four bytes and a short message.
+            _ => 64,
+        }
+}
+
 /// Drive `future` to completion, flushing every [`Progress`] it emits as it emits it.
 ///
 /// `cmd` decides whether log and progress frames go out at all: the attach rule gives
@@ -95,24 +370,57 @@ pub async fn pump<W: Wire, T>(
     queue: &Queue,
     future: impl Future<Output = T>,
 ) -> Result<T, DaemonError> {
+    pump_with(conn, cmd, queue, Io::NONE, future).await
+}
+
+/// One step of [`pump_with`]'s loop.
+enum Step<T> {
+    /// The operation finished.
+    Done(T),
+    /// There is progress to send.
+    Flush,
+    /// The operation is waiting on its [`Io`].
+    Io,
+}
+
+/// [`pump`], for an operation that also reads a streamed payload or writes a streamed
+/// reply through `io`. The pump reads and writes for it between polls, and while the
+/// payload is still arriving it sends little ([`Thinning`]).
+///
+/// # Errors
+/// As [`pump`], and a failure to read the payload or write the reply ends it the same
+/// way: the operation's future is dropped where it stands.
+pub async fn pump_with<W: Wire, T>(
+    conn: &mut W,
+    cmd: Command,
+    queue: &Queue,
+    io: Io<'_>,
+    future: impl Future<Output = T>,
+) -> Result<T, DaemonError> {
     let mut future = pin!(future);
     // The narration is offered to the connection whatever the command; the connection
     // itself keeps the attach rule for the log and progress frames (`Conn::log`,
     // `Conn::progress`).
     let attached = conn.logs_enabled_for(cmd) || conn.narrates();
+    let mut thinning = Thinning::default();
     loop {
-        // One step: either the future finished, or there is progress to flush. It
-        // answers `Pending` only when the future is pending AND the queue is empty, so
-        // the future's own waker is what schedules the next poll — this does not spin.
-        let finished = poll_fn(|cx| {
+        // One step: the future finished, or there is progress to flush, or the future
+        // waits on its streams. It answers `Pending` only when the future is pending
+        // with nothing to flush and nothing to serve, so the future's own waker is what
+        // schedules the next poll — this does not spin.
+        let step = poll_fn(|cx| {
             if !queue.is_empty() {
-                return Poll::Ready(None);
+                return Poll::Ready(Step::Flush);
+            }
+            if io.has_work() {
+                return Poll::Ready(Step::Io);
             }
             match future.as_mut().poll(cx) {
-                Poll::Ready(value) => Poll::Ready(Some(value)),
+                Poll::Ready(value) => Poll::Ready(Step::Done(value)),
                 // The poll above may have pushed progress before returning `Pending`;
                 // flushing it now is what makes a long transfer's bar move.
-                Poll::Pending if !queue.is_empty() => Poll::Ready(None),
+                Poll::Pending if !queue.is_empty() => Poll::Ready(Step::Flush),
+                Poll::Pending if io.has_work() => Poll::Ready(Step::Io),
                 Poll::Pending => Poll::Pending,
             }
         })
@@ -125,34 +433,48 @@ pub async fn pump<W: Wire, T>(
         while let Some(progress) = queue.pop() {
             drained += 1;
             if attached {
-                send(conn, &progress).await?;
+                thinning.offer(conn, &progress).await?;
             }
         }
 
-        if let Some(value) = finished {
-            return Ok(value);
+        match step {
+            Step::Done(value) => {
+                // The last of a streamed reply, if the operation wrote one.
+                io.serve(conn).await?;
+                if attached {
+                    thinning.settle(conn).await?;
+                }
+                return Ok(value);
+            }
+            Step::Io => {
+                io.serve(conn).await?;
+                // Serving answers the wait, or the next step makes the same decision on
+                // the same state and this loop spins for ever.
+                debug_assert!(!io.has_work(), "pump served the streams and left them waiting");
+            }
+            Step::Flush => {
+                // The loop's one invariant, stated where it can catch a mistake: a step that
+                // did not finish the operation only happens because the queue had something in
+                // it, so the drain must have taken at least one event. If it did not, the next
+                // iteration will make the same decision on the same state and this loop will
+                // spin for ever.
+                //
+                // `cargo mutants` found four separate mutations of the queue predicates that
+                // **hang** rather than fail, exactly as an audit found for three
+                // descriptor-walk mutants. A hang is a worse failure than a
+                // panic: it burns a CI slot and reports nothing. `debug_assert` costs nothing in
+                // release and turns all four into an immediate, named test failure.
+                //
+                // **The release build does not depend on this line.** It terminates
+                // because `drained > 0` is an invariant of the loop and not because anything
+                // checks it: reaching here means the step was `Flush`, which the step above only
+                // answers when the queue was non-empty, and nothing but this drain pops the queue.
+                // The assertion exists to make a future edit that breaks the invariant fail fast,
+                // and it does that only where debug assertions are on, so `cargo test --release`
+                // would let those four mutants spin again.
+                debug_assert!(drained > 0, "pump stepped with nothing to flush; this loop would spin");
+            }
         }
-
-        // The loop's one invariant, stated where it can catch a mistake: a step that
-        // did not finish the operation only happens because the queue had something in
-        // it, so the drain must have taken at least one event. If it did not, the next
-        // iteration will make the same decision on the same state and this loop will
-        // spin for ever.
-        //
-        // `cargo mutants` found four separate mutations of the queue predicates that
-        // **hang** rather than fail, exactly as an audit found for three
-        // descriptor-walk mutants. A hang is a worse failure than a
-        // panic: it burns a CI slot and reports nothing. `debug_assert` costs nothing in
-        // release and turns all four into an immediate, named test failure.
-        //
-        // **The release build does not depend on this line.** It terminates
-        // because `drained > 0` is an invariant of the loop and not because anything
-        // checks it: reaching here means `finished` was `None`, which the step above only
-        // answers when the queue was non-empty, and nothing but this drain pops the queue.
-        // The assertion exists to make a future edit that breaks the invariant fail fast,
-        // and it does that only where debug assertions are on, so `cargo test --release`
-        // would let those four mutants spin again.
-        debug_assert!(drained > 0, "pump stepped with nothing to flush; this loop would spin");
     }
 }
 
@@ -226,11 +548,12 @@ async fn send<W: Wire>(conn: &mut W, progress: &Progress) -> Result<(), DaemonEr
 
 #[cfg(test)]
 mod tests {
-    use super::{Queue, pump};
+    use super::{INTAKE_BYTES_STEPS, INTAKE_FRAME_BUDGET, Intake, Io, Outbox, Queue, pump, pump_with};
     use crate::commands::Wire;
     use crate::commands::fake::{LoopbackConn, Sent};
     use tdfu_core::progress::{Phase, Progress};
-    use tdfu_proto::{Command, ProgressBody};
+    use tdfu_core::stream::{AsyncSink as _, AsyncSource as _};
+    use tdfu_proto::{Command, HEADER_LEN, ProgressBody, Status};
     use tdfu_usb::mock::block_on;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -646,5 +969,148 @@ mod tests {
             }
         })
         .await;
+    }
+
+    // ------------------------------------------------------------ streams
+
+    /// What a recorded frame took on the wire, header and all.
+    fn wire_size(frame: &Sent) -> usize {
+        HEADER_LEN
+            + match frame {
+                Sent::Log(line) | Sent::Debug(line) => line.len(),
+                Sent::Progress(body) => body.encode().map_or(0, |bytes| bytes.len()),
+                Sent::Response(_, payload) => payload.len(),
+            }
+    }
+
+    /// **Little goes out while a streamed payload is still arriving**, because a client
+    /// may read nothing until it has sent it all, and what waits unread in its receive
+    /// buffer must never fill it. Byte counts are thinned, the rest stays under a budget,
+    /// the narration past the budget is counted and owned up to once the payload is in,
+    /// and from then on everything flows as it always does.
+    #[test]
+    fn little_goes_out_while_a_payload_is_arriving() -> TestResult {
+        const LEN: usize = 1 << 20;
+        const BLOCK: usize = 4096;
+        let payload: Vec<u8> = (0..=250_u8).cycle().take(LEN).collect();
+        let mut conn = LoopbackConn::raw().narrating().during(Command::Write);
+        conn.feed(&payload);
+        let queue = Queue::new();
+        let intake = Intake::new();
+        let got = std::cell::RefCell::new(Vec::new());
+        let io = Io {
+            intake: Some(&intake),
+            outbox: None,
+        };
+        let mut sink = queue.sink();
+        block_on(pump_with(&mut conn, Command::Write, &queue, io, async {
+            let mut source = intake.source();
+            let mut block = vec![0_u8; BLOCK];
+            sink(Progress::Phase(Phase::Download));
+            for done in (BLOCK..=LEN).step_by(BLOCK) {
+                source.read_exact(&mut block).await?;
+                got.borrow_mut().extend_from_slice(&block);
+                sink(Progress::Debug(format!(
+                    "download: block at {done:>8} went out, {}",
+                    "-".repeat(80)
+                )));
+                sink(Progress::Bytes {
+                    phase: Phase::Download,
+                    done: done as u64,
+                    total: Some(LEN as u64),
+                });
+            }
+            sink(Progress::Note("Write complete".to_owned()));
+            Ok::<(), std::io::Error>(())
+        }))??;
+        assert_eq!(got.into_inner(), payload, "the operation read the payload, in order");
+
+        let sent = conn.sent();
+        let left = conn.payload_left_at_each_frame();
+        let during: Vec<&Sent> = sent
+            .iter()
+            .zip(&left)
+            .filter(|(_, left)| **left > 0)
+            .map(|(frame, _)| frame)
+            .collect();
+        let bytes: usize = during.iter().map(|frame| wire_size(frame)).sum();
+        assert!(
+            bytes <= INTAKE_FRAME_BUDGET,
+            "{bytes} bytes went out while the payload arrived"
+        );
+        let counts = during.iter().filter(|frame| matches!(frame, Sent::Progress(_))).count();
+        assert!(
+            counts <= usize::try_from(INTAKE_BYTES_STEPS)? + 2,
+            "{counts} progress frames while the payload arrived"
+        );
+        assert!(counts > 2, "the bar still moves: {counts}");
+        let held = sent
+            .iter()
+            .find_map(|frame| match frame {
+                Sent::Debug(line) if line.contains("narration lines were not sent") => Some(line.clone()),
+                _ => None,
+            })
+            .ok_or("the held-back narration is owned up to")?;
+        let count: usize = held.split(' ').next().unwrap_or("0").parse()?;
+        let narrated = sent.iter().filter(|frame| matches!(frame, Sent::Debug(_))).count();
+        assert_eq!(
+            count + narrated - 1,
+            LEN / BLOCK,
+            "every line is either sent or counted: {held}"
+        );
+        assert!(
+            sent.contains(&Sent::Progress(ProgressBody {
+                percent: 100,
+                stage: Phase::Download.wire_byte(),
+                message: format!("{LEN}/{LEN} bytes"),
+            })),
+            "the last count goes out"
+        );
+        assert_eq!(sent.last(), Some(&Sent::Log("Write complete\n".to_owned())));
+        Ok(())
+    }
+
+    /// A request read whole is never thinned: nothing is arriving.
+    #[test]
+    fn a_whole_request_is_not_thinned() -> TestResult {
+        let mut conn = LoopbackConn::raw().during(Command::Write);
+        let queue = Queue::new();
+        let mut sink = queue.sink();
+        block_on(pump_with(&mut conn, Command::Write, &queue, Io::NONE, async {
+            for done in 1..=500_u64 {
+                sink(Progress::Bytes {
+                    phase: Phase::Download,
+                    done,
+                    total: Some(500),
+                });
+            }
+        }))?;
+        assert_eq!(conn.progress_frames().len(), 500);
+        Ok(())
+    }
+
+    /// **A reply can be written by the operation itself**, through the pump, in order,
+    /// whatever sizes it writes in; the last of it goes out before the pump returns.
+    #[test]
+    fn an_operation_writes_its_reply_through_the_outbox() -> TestResult {
+        let body: Vec<u8> = (0..50_000_u32).map(|at| (at % 253) as u8).collect();
+        let mut conn = LoopbackConn::raw().during(Command::Read);
+        block_on(conn.begin_reply(Status::Ok, body.len() as u64))?;
+        let outbox = Outbox::new();
+        let io = Io {
+            intake: None,
+            outbox: Some(&outbox),
+        };
+        block_on(pump_with(&mut conn, Command::Read, &Queue::new(), io, async {
+            let mut out = outbox.sink();
+            for piece in body.chunks(3001) {
+                out.write_all(piece).await?;
+                yield_once().await;
+            }
+            Ok::<(), std::io::Error>(())
+        }))??;
+        block_on(conn.end_reply())?;
+        assert_eq!(conn.response(), Some((Status::Ok, body)));
+        Ok(())
     }
 }

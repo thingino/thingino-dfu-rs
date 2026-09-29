@@ -49,7 +49,7 @@ pub use erase::erase;
 pub use probe::{probe, probe_with_progress};
 pub use read::{read, read_to};
 pub use reboot::reboot;
-pub use verify::{verify, verify_with};
+pub use verify::{matched_note, verify, verify_with};
 pub use write::{write, write_from};
 
 pub use crate::dfu::descriptors::classify;

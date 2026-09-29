@@ -17,20 +17,35 @@
 //! the one place the C was safer than us. The CRC is
 //! computed **as the bytes stream past**, through `tdfu_proto`'s resumable
 //! [`Crc32`](tdfu_proto::Crc32), so the image is not walked a second time.
+//!
+//! # The reply streams
+//!
+//! The reply's header carries the image's length, and a DFU upload's length is known
+//! only once its short block has arrived; that is what the staging file is for. The
+//! reply then goes out from the file a piece at a time ([`Wire::begin_reply`]), so no
+//! copy of the image is held in memory at all. A daemon with no disk reads the alt
+//! twice instead ([`ReadStaging::TwoPass`]): once for the length and the CRC, with the
+//! progress a client watches, and once straight into the reply.
 
 use std::io::{Read, Write};
 
 use tdfu_core::clock::Sleeper;
+use tdfu_core::model::AltSel;
+use tdfu_core::progress::Progress;
+use tdfu_core::stream::AsyncSink;
 use tdfu_core::{Error, ops};
-use tdfu_proto::{Command, Crc32};
-use tdfu_usb::LocalUsbBackend;
+use tdfu_proto::{Command, Crc32, Status};
+use tdfu_usb::{LocalUsbBackend, LocalUsbTransport};
 
 use super::device::{Target, await_gadget};
-use super::report::{Queue, pump};
+use super::report::{Io, Outbox, Queue, pump, pump_with};
 use super::staging::Staged;
-use super::state::{Activity, DaemonState};
+use super::state::{Activity, DaemonState, ReadStaging};
 use super::{Reply, Wire, parse_alt, variant_field};
 use crate::errors::{DaemonError, wire_message};
+
+/// How much of a staged image is sent at a time.
+const SEND_CHUNK: usize = 16 * 1024;
 
 /// The empty-image refusal (`dfu-remote/main.c:689`).
 const EMPTY: &str = "read returned empty data";
@@ -119,6 +134,28 @@ where
         Err(failure) => return Ok(Reply::failed("read", &failure.into_error())),
     };
 
+    match state.read_staging {
+        ReadStaging::TwoPass => twice(conn, &gadget.device, &state.clock, &alt, &queue, &mut sink, ceiling).await,
+        // `ReadStaging` is `#[non_exhaustive]`; the file is the default and the fallback.
+        _ => staged(conn, state, &gadget.device, &alt, &queue, &mut sink, ceiling).await,
+    }
+}
+
+/// Read the alt into a staging file, then send the file.
+async fn staged<W, B, C, T>(
+    conn: &mut W,
+    state: &DaemonState<B, C>,
+    device: &T,
+    alt: &AltSel,
+    queue: &Queue,
+    sink: &mut dyn FnMut(Progress),
+    ceiling: u64,
+) -> Result<Reply, DaemonError>
+where
+    W: Wire,
+    C: Sleeper,
+    T: LocalUsbTransport,
+{
     let mut staged = match Staged::create(&state.staging_dir, "tdfu-read") {
         Ok(staged) => staged,
         Err(error) => return Ok(Reply::failed("read", &Error::Io(error))),
@@ -136,71 +173,181 @@ where
         let outcome = pump(
             conn,
             Command::Read,
-            &queue,
+            queue,
             // The request has no length field, so the alt is read to its short block,
             // and no limit is passed: a device that never sends one is stopped by the
             // sink at [`CEILING`], which is what this reply can carry, rather than
             // followed until the filesystem fills with the daemon wholly occupied by it.
-            ops::read(&gadget.device, &state.clock, &alt, None, &mut tee, &mut sink),
+            ops::read(device, &state.clock, alt, None, &mut tee, sink),
         )
         .await?;
         (outcome, tee.capped(), tee.written())
     };
 
-    let total = match outcome {
-        (Ok(total), _, _) => total,
-        // Refused here, before the image is read back into memory: the alternative is
-        // to stage the whole of it, double it in RAM, and only then find that the length
-        // field cannot describe it, which the transport answers by dropping the
-        // connection with no error frame at all.
-        (Err(_), true, written) => {
-            return Ok(Reply::Error(format!(
-                "read stopped at {written} bytes: this alt is larger than one reply can carry, \
-                 and the device sent no end of data within it"
-            )));
-        }
-        (Err(error), false, _) => return Ok(Reply::failed("read", &error)),
+    let total = match counted(outcome) {
+        Ok(total) => total,
+        Err(reply) => return Ok(reply),
     };
-    if total == 0 {
-        return Ok(Reply::Error(EMPTY.to_owned()));
-    }
 
-    // The seam's `respond` takes a slice, so the image is read back into memory to be
-    // answered. The C does the same and then keeps a *second* copy — `read_data` at
-    // `dfu-remote/main.c:692` plus `resp` at `:714`, about 512 MiB peak for a 256 MiB
-    // T40XP chip. This builds one buffer and appends four bytes to it.
-    //
-    // **The stated baseline is one copy of the image**, and it is what a later streaming
-    // `respond` has to be measured against (recorded as Known-open in the
-    // contracts). None of the three transports copies it again: `raw.rs:51`, `ws.rs:159`
-    // and `http.rs:186` each `write_all` the parts in turn behind a header they size
-    // arithmetically. Streaming needs a fifth `Wire` method taking a length and a reader,
-    // which is a seam amendment rather than a defect fix; `Staged`'s `Drop` already
-    // answers the ownership half of it.
+    // Opened before the reply begins, so a file that cannot be read back is still an
+    // answer rather than a connection cut off mid-reply. The C reads the whole image into
+    // memory and then keeps a *second* copy — `read_data` at `dfu-remote/main.c:692` plus
+    // `resp` at `:714`, about 512 MiB peak for a 256 MiB T40XP chip. This holds one
+    // chunk.
     let path = staged.finish().to_path_buf();
-    let mut payload = match read_back(&path, total) {
-        Ok(payload) => payload,
+    let mut file = match std::fs::File::open(&path) {
+        Ok(file) => file,
         Err(error) => return Ok(Reply::failed("read", &Error::Io(error))),
     };
-    payload.extend_from_slice(&crc.finalize().to_be_bytes());
+    conn.begin_reply(Status::Ok, total + 4).await?;
+    let mut chunk = vec![0_u8; SEND_CHUNK];
+    let mut sent = 0_u64;
+    while sent < total {
+        // **Blocking**, as the staging writes before it are. Safe because everything is
+        // serialised: one connection, served to completion on a current-thread runtime
+        // with no other task to starve. `spawn_blocking` would need a `Send` future,
+        // which decision D1 rules out.
+        let got = file.read(&mut chunk)?;
+        let take = u64::try_from(got).unwrap_or(u64::MAX).min(total - sent);
+        let Some(piece) = chunk
+            .get(..usize::try_from(take).unwrap_or(0))
+            .filter(|piece| !piece.is_empty())
+        else {
+            return Err(DaemonError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("the staged image ended at {sent} of {total} bytes"),
+            )));
+        };
+        conn.reply_body(piece).await?;
+        sent += take;
+    }
+    conn.reply_body(&crc.finalize().to_be_bytes()).await?;
+    conn.end_reply().await?;
     tracing::debug!(total, "read complete");
-    Ok(Reply::Bulk(payload))
+    Ok(Reply::Sent)
 }
 
-/// Read the staged image back, with room for the four CRC bytes already reserved.
+/// Read the alt twice: once for its length and CRC, with the progress a client watches,
+/// and once into the reply, whose header needs that length before a byte of it.
 ///
-/// **This blocks the runtime thread, deliberately**: up to 256 MiB for a
-/// T40XP NAND alt, and `Staged::create`, `Tee::write` and `loader::resolve(…).read()` are
-/// blocking too. Safe because everything is serialised: the accept loop
-/// handles one connection to completion and the current-thread runtime has no other task
-/// to starve. What it does cost is that no timer fires for the duration, so a `Timeouts`
-/// deadline armed elsewhere would not tick while this runs. `spawn_blocking` is not the
-/// answer: it needs a `Send` future, which decision D1 rules out.
-fn read_back(path: &std::path::Path, total: u64) -> std::io::Result<Vec<u8>> {
-    let capacity = usize::try_from(total).unwrap_or(usize::MAX).saturating_add(4);
-    let mut payload = Vec::with_capacity(capacity);
-    std::fs::File::open(path)?.read_to_end(&mut payload)?;
-    Ok(payload)
+/// The second pass is capped at the first's length, and the CRC sent is the first's: a
+/// second read that differs is then a CRC mismatch at the client, which is the truth,
+/// rather than a checksum that vouches for whichever read happened last. The second
+/// pass sends no progress, being inside the reply.
+async fn twice<W, C, T>(
+    conn: &mut W,
+    device: &T,
+    clock: &C,
+    alt: &AltSel,
+    queue: &Queue,
+    sink: &mut dyn FnMut(Progress),
+    ceiling: u64,
+) -> Result<Reply, DaemonError>
+where
+    W: Wire,
+    C: Sleeper,
+    T: LocalUsbTransport,
+{
+    let mut crc = Crc32::new();
+    let outcome = {
+        let mut nowhere = std::io::sink();
+        let mut tee = Tee::new(&mut nowhere, &mut crc, ceiling);
+        let outcome = pump(
+            conn,
+            Command::Read,
+            queue,
+            ops::read(device, clock, alt, None, &mut tee, sink),
+        )
+        .await?;
+        (outcome, tee.capped(), tee.written())
+    };
+    let total = match counted(outcome) {
+        Ok(total) => total,
+        Err(reply) => return Ok(reply),
+    };
+    let first = crc.finalize();
+
+    conn.begin_reply(Status::Ok, total + 4).await?;
+    let outbox = Outbox::new();
+    let (second, again) = {
+        let mut out = Crc32Out {
+            inner: outbox.sink(),
+            crc: Crc32::new(),
+        };
+        let io = Io {
+            intake: None,
+            outbox: Some(&outbox),
+        };
+        let mut quiet = |progress: Progress| {
+            if let Progress::Debug(line) = progress {
+                tracing::debug!("{line}");
+            }
+        };
+        let second = pump_with(
+            conn,
+            Command::Read,
+            &Queue::new(),
+            io,
+            ops::read_to(device, clock, alt, Some(total), &mut out, &mut quiet),
+        )
+        .await?;
+        (second, out.crc.finalize())
+    };
+    match second {
+        Ok(read) if read == total => {}
+        // The reply's length is on the wire already, so it cannot be completed; the
+        // connection ends, which the client sees as a reply cut short.
+        Ok(read) => {
+            return Err(DaemonError::Io(std::io::Error::other(format!(
+                "the second read of the alt ended at {read} of {total} bytes"
+            ))));
+        }
+        Err(error) => {
+            return Err(DaemonError::Io(std::io::Error::other(format!(
+                "the second read of the alt failed: {error}"
+            ))));
+        }
+    }
+    if again != first {
+        tracing::warn!(
+            "the alt read back differently the second time (CRC32 0x{first:08X}, then 0x{again:08X}); \
+             the client's CRC check will refuse it"
+        );
+    }
+    conn.reply_body(&first.to_be_bytes()).await?;
+    conn.end_reply().await?;
+    tracing::debug!(total, "read complete");
+    Ok(Reply::Sent)
+}
+
+/// A finished first read as the length to answer with, or the answer itself.
+fn counted(outcome: (Result<u64, Error>, bool, u64)) -> Result<u64, Reply> {
+    match outcome {
+        (Ok(0), _, _) => Err(Reply::Error(EMPTY.to_owned())),
+        (Ok(total), _, _) => Ok(total),
+        // Refused here, before any of the image is sent: the alternative is to find
+        // that the length field cannot describe it only once a reply is on its way.
+        (Err(_), true, written) => Err(Reply::Error(format!(
+            "read stopped at {written} bytes: this alt is larger than one reply can carry, \
+             and the device sent no end of data within it"
+        ))),
+        (Err(error), false, _) => Err(Reply::failed("read", &error)),
+    }
+}
+
+/// A sink that passes everything on and keeps its CRC: the second read, checked against
+/// the first.
+struct Crc32Out<S> {
+    inner: S,
+    crc: Crc32,
+}
+
+impl<S: AsyncSink> AsyncSink for Crc32Out<S> {
+    async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.inner.write_all(data).await?;
+        self.crc.update(data);
+        Ok(())
+    }
 }
 
 /// A sink that writes to the staging file and feeds the CRC at the same time, and
@@ -285,9 +432,10 @@ impl<W: Write> Write for Tee<'_, W> {
 #[cfg(test)]
 mod tests {
     use super::EMPTY;
+    use crate::commands::fake::Sent;
     use crate::commands::fake::{FakeBackend, LoopbackConn, Scratch, TestResult};
     use crate::commands::fake::{dispatch, seen};
-    use crate::commands::state::{Activity, DaemonState, Window};
+    use crate::commands::state::{Activity, DaemonState, ReadStaging, Window};
     use tdfu_core::clock::RecordingClock;
     use tdfu_proto::{Command, Request, Status, crc32};
     use tdfu_usb::mock::block_on;
@@ -437,17 +585,22 @@ mod tests {
         Ok(())
     }
 
-    /// A `READ` OK payload is exempt from the 64 MiB cap, and the exemption
-    /// is expressed as `Reply::Bulk` rather than as a missing check.
+    /// A `READ` streams its reply, so the image is never held whole: the handler has
+    /// answered by the time it returns, and the one final frame is the data and its CRC.
+    /// The 64 MiB exemption a NAND alt 0 needs is `Conn::begin_reply`'s, pinned on the
+    /// wire in `tests/transport.rs`.
     #[test]
-    fn rpc_read_answers_with_a_bulk_reply() -> TestResult {
-        let scratch = Scratch::new("read-bulk")?;
+    fn rpc_read_streams_its_reply() -> TestResult {
+        let scratch = Scratch::new("read-streamed")?;
         let backend = FakeBackend::new(vec![FakeBackend::gadget_holding(&[0x01; 512])]);
         let mut state = daemon(backend, scratch.root());
         block_on(seen(&mut state))?;
         let mut conn = LoopbackConn::raw();
         let reply = block_on(super::handle(&mut conn, &mut state, 0, &[], None))?;
-        assert!(matches!(reply, crate::commands::Reply::Bulk(_)), "{reply:?}");
+        assert_eq!(reply, crate::commands::Reply::Sent);
+        let mut expected = vec![0x01_u8; 512];
+        expected.extend_from_slice(&tdfu_proto::crc32(&expected).to_be_bytes());
+        assert_eq!(conn.response(), Some((tdfu_proto::Status::Ok, expected)));
         Ok(())
     }
 
@@ -642,6 +795,76 @@ mod tests {
         let message = conn.error_text().ok_or("an unwritable staging dir must be refused")?;
         assert!(message.starts_with("read failed: File I/O error: "), "{message}");
         assert_eq!(state.activity(), Activity::Idle);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------ two passes
+
+    fn read_payload() -> Result<Vec<u8>, tdfu_proto::ProtoError> {
+        Request::Read {
+            index: 0,
+            variant: Vec::new(),
+            alt: None,
+        }
+        .encode()
+    }
+
+    /// **A daemon with no disk answers a `READ` all the same**: the alt is read once for
+    /// its length and CRC and once into the reply. The staging directory here does not
+    /// exist, so a staging file would have failed the read.
+    #[test]
+    fn a_two_pass_read_needs_no_staging_file() -> TestResult {
+        let image: Vec<u8> = (0..9000_u32).map(|at| (at % 247) as u8).collect();
+        let backend = FakeBackend::new(vec![FakeBackend::gadget_holding(&image)]);
+        let mut state =
+            daemon(backend, std::path::Path::new("/nonexistent-staging-dir")).with_read_staging(ReadStaging::TwoPass);
+        block_on(seen(&mut state))?;
+        let mut conn = LoopbackConn::raw().watching(state.watch());
+        block_on(dispatch(&mut conn, &mut state, Command::Read, &read_payload()?))?;
+
+        let mut expected = image.clone();
+        expected.extend_from_slice(&crc32(&image).to_be_bytes());
+        assert_eq!(conn.response(), Some((Status::Ok, expected)), "{:?}", conn.error_text());
+        assert!(
+            matches!(conn.sent().last(), Some(Sent::Response(..))),
+            "nothing follows the reply"
+        );
+        assert_eq!(state.activity(), Activity::Idle);
+        Ok(())
+    }
+
+    /// The progress a client watches is the first pass's, and only the first's: the
+    /// second is inside the reply, where no other frame may go. A staged read sends the
+    /// same frames.
+    #[test]
+    fn a_two_pass_read_reports_one_pass_of_progress() -> TestResult {
+        let image = vec![0x33_u8; 9000];
+        let mut frames = Vec::new();
+        for staging in [ReadStaging::File, ReadStaging::TwoPass] {
+            let scratch = Scratch::new("read-two-pass-progress")?;
+            let backend = FakeBackend::new(vec![FakeBackend::gadget_holding(&image)]);
+            let mut state = daemon(backend, scratch.root()).with_read_staging(staging);
+            block_on(seen(&mut state))?;
+            let mut conn = LoopbackConn::raw();
+            block_on(dispatch(&mut conn, &mut state, Command::Read, &read_payload()?))?;
+            assert!(conn.response().is_some_and(|(status, _)| status == Status::Ok));
+            frames.push(conn.progress_frames());
+        }
+        assert!(!frames[0].is_empty());
+        assert_eq!(frames[0], frames[1]);
+        Ok(())
+    }
+
+    /// An alt that answers nothing is refused after the first pass, before any reply.
+    #[test]
+    fn a_two_pass_read_of_nothing_is_refused() -> TestResult {
+        let backend = FakeBackend::new(vec![FakeBackend::gadget_holding(&[])]);
+        let mut state =
+            daemon(backend, std::path::Path::new("/nonexistent-staging-dir")).with_read_staging(ReadStaging::TwoPass);
+        block_on(seen(&mut state))?;
+        let mut conn = LoopbackConn::raw();
+        block_on(dispatch(&mut conn, &mut state, Command::Read, &read_payload()?))?;
+        assert_eq!(conn.error_text().as_deref(), Some(EMPTY));
         Ok(())
     }
 }

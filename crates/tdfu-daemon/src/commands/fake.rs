@@ -15,6 +15,7 @@
 
 use core::cell::{Cell, RefCell};
 use core::time::Duration;
+use std::collections::VecDeque;
 use std::rc::Rc;
 
 use tdfu_core::addr::{self, Kseg1};
@@ -120,6 +121,17 @@ pub struct LoopbackConn {
     /// test can see the state *during* an operation and not only after it.
     watch: Option<ActivityWatch>,
     seen: RefCell<Vec<Activity>>,
+    /// A streamed request's payload, still to be read, as the socket would hold it.
+    payload: RefCell<VecDeque<u8>>,
+    /// Payload bytes the client sends before it stops, modelling a client that went away
+    /// mid-upload; `None` sends it all.
+    payload_budget: Cell<Option<usize>>,
+    /// Payload bytes a final frame read and dropped, as `Conn::drain_payload` does.
+    drained: Cell<usize>,
+    /// How much of the payload was still unread as each frame went out.
+    left_at: RefCell<Vec<u64>>,
+    /// A reply opened by `begin_reply`: its status, announced length, and bytes so far.
+    reply: RefCell<Option<(Status, u64, Vec<u8>)>>,
 }
 
 impl LoopbackConn {
@@ -135,7 +147,50 @@ impl LoopbackConn {
             budget: Cell::new(None),
             watch: None,
             seen: RefCell::new(Vec::new()),
+            payload: RefCell::new(VecDeque::new()),
+            payload_budget: Cell::new(None),
+            drained: Cell::new(0),
+            left_at: RefCell::new(Vec::new()),
+            reply: RefCell::new(None),
         }
+    }
+
+    /// A streamed request's payload, as `Conn::next_incoming` leaves it on the socket.
+    pub fn feed(&self, payload: &[u8]) {
+        self.payload.borrow_mut().extend(payload.iter().copied());
+    }
+
+    /// A client that stops sending after `bytes` more bytes of the payload.
+    #[must_use]
+    pub fn stopping_after(self, bytes: usize) -> Self {
+        self.payload_budget.set(Some(bytes));
+        self
+    }
+
+    /// Payload bytes a final frame read and dropped rather than the command.
+    #[must_use]
+    pub fn drained(&self) -> usize {
+        self.drained.get()
+    }
+
+    /// How much of the payload was still unread as each frame went out, in order.
+    #[must_use]
+    pub fn payload_left_at_each_frame(&self) -> Vec<u64> {
+        self.left_at.borrow().clone()
+    }
+
+    /// Read and drop the payload's rest, as every final frame does.
+    fn drain(&self) {
+        let mut payload = self.payload.borrow_mut();
+        self.drained.set(self.drained.get() + payload.len());
+        payload.clear();
+    }
+
+    fn refuse_inside_a_reply(&self) -> Result<(), DaemonError> {
+        if self.reply.borrow().is_some() {
+            return Err(DaemonError::Stream("a frame inside an open reply"));
+        }
+        Ok(())
     }
 
     /// Put `cmd` in flight, as `Conn::next_request` does for the real connection
@@ -264,6 +319,15 @@ impl LoopbackConn {
     }
 
     fn record(&self, frame: Sent) -> Result<(), DaemonError> {
+        self.refuse_inside_a_reply()?;
+        self.spend()?;
+        self.sent.borrow_mut().push(frame);
+        Ok(())
+    }
+
+    /// One frame's worth of the client's patience, and the bookkeeping that goes with it.
+    fn spend(&self) -> Result<(), DaemonError> {
+        self.left_at.borrow_mut().push(self.payload.borrow().len() as u64);
         if let Some(watch) = &self.watch {
             self.seen.borrow_mut().push(watch.get());
         }
@@ -276,14 +340,16 @@ impl LoopbackConn {
             Some(left) => self.budget.set(Some(left.saturating_sub(1))),
             None => {}
         }
-        self.sent.borrow_mut().push(frame);
         Ok(())
     }
 }
 
 impl Wire for LoopbackConn {
-    /// The final frame, which is never gated: every command is answered.
+    /// The final frame, which is never gated: every command is answered. The payload's
+    /// unread rest is dropped first, as `Conn::respond` does.
     async fn respond(&mut self, status: Status, payload: &[u8]) -> Result<(), DaemonError> {
+        self.refuse_inside_a_reply()?;
+        self.drain();
         self.record(Sent::Response(status, payload.to_vec()))
     }
 
@@ -343,6 +409,67 @@ impl Wire for LoopbackConn {
     fn logs_enabled_for(&self, cmd: Command) -> bool {
         self.http || matches!(cmd, Command::Bootstrap | Command::Write | Command::Read)
     }
+
+    async fn payload(&mut self, buf: &mut [u8]) -> Result<(), DaemonError> {
+        let mut payload = self.payload.borrow_mut();
+        if buf.len() > payload.len() {
+            return Err(DaemonError::Stream("read past the end of the request payload"));
+        }
+        if let Some(budget) = self.payload_budget.get() {
+            if budget < buf.len() {
+                payload.drain(..budget);
+                self.payload_budget.set(Some(0));
+                return Err(DaemonError::Truncated {
+                    doing: "payload",
+                    got: budget,
+                    want: buf.len(),
+                });
+            }
+            self.payload_budget.set(Some(budget - buf.len()));
+        }
+        let want = buf.len();
+        for (slot, byte) in buf.iter_mut().zip(payload.drain(..want)) {
+            *slot = byte;
+        }
+        Ok(())
+    }
+
+    fn payload_left(&self) -> u64 {
+        self.payload.borrow().len() as u64
+    }
+
+    /// Counted as one frame when it opens, recorded whole as a [`Sent::Response`] when it
+    /// closes, so a test reads a streamed reply exactly as it reads any other.
+    async fn begin_reply(&mut self, status: Status, len: u64) -> Result<(), DaemonError> {
+        self.refuse_inside_a_reply()?;
+        self.drain();
+        self.spend()?;
+        *self.reply.borrow_mut() = Some((status, len, Vec::new()));
+        Ok(())
+    }
+
+    async fn reply_body(&mut self, bytes: &[u8]) -> Result<(), DaemonError> {
+        let mut reply = self.reply.borrow_mut();
+        let Some((_, len, body)) = reply.as_mut() else {
+            return Err(DaemonError::Stream("reply bytes with no reply open"));
+        };
+        if (body.len() + bytes.len()) as u64 > *len {
+            return Err(DaemonError::Stream("reply bytes past the announced length"));
+        }
+        body.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    async fn end_reply(&mut self) -> Result<(), DaemonError> {
+        let Some((status, len, body)) = self.reply.borrow_mut().take() else {
+            return Err(DaemonError::Stream("no reply is open"));
+        };
+        if body.len() as u64 != len {
+            return Err(DaemonError::Stream("the reply ended short of its announced length"));
+        }
+        self.sent.borrow_mut().push(Sent::Response(status, body));
+        Ok(())
+    }
 }
 
 /// [`commands::dispatch`](super::dispatch), with the connection put in the state the
@@ -374,6 +501,29 @@ where
 {
     conn.serving(Some(cmd));
     let outcome = super::dispatch(conn, state, cmd, payload).await;
+    conn.serving(None);
+    outcome
+}
+
+/// [`commands::dispatch_streamed`](super::dispatch_streamed), with `payload` left on the
+/// connection as `Conn::next_incoming` leaves a streamed one, and the command in flight as
+/// [`dispatch`] puts it.
+///
+/// # Errors
+/// Whatever [`dispatch_streamed`](super::dispatch_streamed) returns.
+pub async fn dispatch_streamed<B, C>(
+    conn: &mut LoopbackConn,
+    state: &mut super::state::DaemonState<B, C>,
+    cmd: Command,
+    payload: &[u8],
+) -> Result<(), DaemonError>
+where
+    B: LocalUsbBackend,
+    C: tdfu_core::clock::Sleeper,
+{
+    conn.feed(payload);
+    conn.serving(Some(cmd));
+    let outcome = super::dispatch_streamed(conn, state, cmd, payload.len() as u64).await;
     conn.serving(None);
     outcome
 }
@@ -956,10 +1106,12 @@ fn upload_script(mut device: MockTransport, in_configuration: &mut bool, address
         device = device.expecting(Call::SetConfiguration(bootrom::CONFIGURATION), Reply::Done);
         *in_configuration = true;
     }
-    device
-        .expecting(Call::ClaimInterface(bootrom::INTERFACE), Reply::Done)
-        .expecting(Call::BulkOut { data: image.to_vec() }, Reply::Transferred(image.len()))
-        .expecting(Call::ReleaseInterface(0), Reply::Done)
+    device = device.expecting(Call::ClaimInterface(bootrom::INTERFACE), Reply::Done);
+    // One bulk transfer per chunk, as the bootrom sees them.
+    for chunk in image.chunks(bootrom::BULK_CHUNK) {
+        device = device.expecting(Call::BulkOut { data: chunk.to_vec() }, Reply::Transferred(chunk.len()));
+    }
+    device.expecting(Call::ReleaseInterface(0), Reply::Done)
 }
 
 /// A whole successful bootstrap of `stage1` + `uboot` (raw; the script pads with the

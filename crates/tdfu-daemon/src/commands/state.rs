@@ -476,6 +476,22 @@ impl Default for Window {
     }
 }
 
+/// How `READ` learns the image's length before its reply, whose header carries it.
+///
+/// A DFU upload ends at the device's short block, so the length is known only once the
+/// whole alt has been read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ReadStaging {
+    /// Read the alt into a file under [`DaemonState::staging_dir`], then send the file.
+    #[default]
+    File,
+    /// Read the alt twice: once to learn its length and CRC, once into the reply. Twice
+    /// the time on the bus, and no copy of the image anywhere, for a daemon with neither
+    /// a disk nor the RAM to hold one.
+    TwoPass,
+}
+
 /// Everything one daemon process carries across commands.
 ///
 /// Generic over the backend and the clock for the reason the CLI is: nothing in this
@@ -498,6 +514,12 @@ pub struct DaemonState<B, C> {
     pub staging_dir: PathBuf,
     /// The re-enumeration window, injectable so it can be pinned.
     pub window: Window,
+    /// Request payloads larger than this are not read whole: `WRITE` and `BOOTSTRAP`
+    /// read their images from the socket as they go to the device. `None` reads every
+    /// payload whole, which keeps a `WRITE`'s CRC check ahead of the flash it guards.
+    pub stream_above: Option<u32>,
+    /// How `READ` learns the length of what it is about to send.
+    pub read_staging: ReadStaging,
     /// The port → SoC memory.
     pub variants: VariantCache,
     /// The listing the last `DISCOVER` answered with, which is what every `idx` on the
@@ -516,6 +538,8 @@ impl<B, C> DaemonState<B, C> {
             firmware_dir: firmware_dir.into(),
             staging_dir: std::env::temp_dir(),
             window: Window::default(),
+            stream_above: None,
+            read_staging: ReadStaging::File,
             variants: VariantCache::new(),
             listing: None,
             activity: Rc::new(Cell::new(Activity::Idle)),
@@ -578,6 +602,21 @@ impl<B, C> DaemonState<B, C> {
     #[must_use]
     pub fn with_staging_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.staging_dir = dir.into();
+        self
+    }
+
+    /// Stream request payloads larger than `limit` bytes rather than read them whole.
+    /// See [`DaemonState::stream_above`].
+    #[must_use]
+    pub const fn with_stream_above(mut self, limit: u32) -> Self {
+        self.stream_above = Some(limit);
+        self
+    }
+
+    /// Answer `READ` without a staging file. See [`ReadStaging::TwoPass`].
+    #[must_use]
+    pub const fn with_read_staging(mut self, staging: ReadStaging) -> Self {
+        self.read_staging = staging;
         self
     }
 

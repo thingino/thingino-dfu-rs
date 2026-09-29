@@ -36,17 +36,27 @@
 //! reported. `tdfu_proto::verify_failed_message` is the single producer of that text;
 //! `tdfu_core::Error::Verify`'s own `Display` is the *local* wording and must not reach
 //! the wire.
+//!
+//! # A streamed write checks its CRC last
+//!
+//! A daemon that cannot hold the image ([`streamed`]) writes it as it arrives, and the
+//! CRC, which follows the image on the wire, can then only be checked once the flash
+//! already holds it. A mismatch is still refused, and says what state it left. Its
+//! verify has no image to compare with either, so it compares CRCs, and a mismatch has
+//! no offset to report: `verify failed: ...` keeps the prefix and says why.
 
 use tdfu_core::clock::Sleeper;
 use tdfu_core::model::AltSel;
+use tdfu_core::stream::{AsyncSink, AsyncSource};
 use tdfu_core::{Error, ops};
-use tdfu_proto::{Command, Request, crc32, verify_failed_message};
+use tdfu_proto::{Command, Crc32, Request, crc32, verify_failed_message};
 use tdfu_usb::LocalUsbBackend;
 
 use super::device::{Target, await_gadget};
-use super::report::{Queue, pump};
+use super::fields::{Fields, Refusal};
+use super::report::{Intake, Io, Queue, pump, pump_with};
 use super::state::{Activity, DaemonState};
-use super::{Reply, Wire, parse_alt, variant_field};
+use super::{Reply, Wire, parse_alt, run_whole, variant_field};
 use crate::errors::{DaemonError, wire_message};
 
 /// The CRC refusal (`dfu-remote/main.c:498`).
@@ -213,6 +223,216 @@ where
     }
 }
 
+/// A streamed `WRITE`: the image goes from the socket to the device as it arrives.
+///
+/// The fields are read with [`Request::decode`]'s checks ([`Fields`]), and every length
+/// is checked against the payload before the device is touched, as decoding a whole
+/// payload first does. An image small enough to hold after all, at most
+/// [`DaemonState::stream_above`], is read whole and takes [`handle`]'s path, the CRC
+/// ahead of the flash; that is where the erase token goes too.
+///
+/// # Errors
+/// [`DaemonError`] only if the connection failed.
+pub async fn streamed<W, B, C>(conn: &mut W, state: &mut DaemonState<B, C>, len: u64) -> Result<Reply, DaemonError>
+where
+    W: Wire,
+    B: LocalUsbBackend,
+    C: Sleeper,
+{
+    let (head, fields) = match Head::read(conn, len).await {
+        Ok(read) => read,
+        Err(Refusal::Payload(message)) => return Ok(Reply::Error(message.to_owned())),
+        Err(Refusal::Conn(error)) => return Err(error),
+    };
+    if state.stream_above.is_none_or(|limit| head.image_len <= limit) {
+        return run_whole(conn, state, Command::Write, fields.into_read()).await;
+    }
+    let (alt, _variant) = match parse_fields(&head.variant, &head.alt) {
+        Ok(fields) => fields,
+        Err(error) => return Ok(Reply::Error(wire_message(&error))),
+    };
+
+    state.arm();
+    let busy = state.busy(Activity::Writing);
+
+    let target = match state.row(head.index) {
+        Ok(row) => Target::of_row(head.index, row),
+        Err(error) => return Ok(Reply::failed("write", &error)),
+    };
+    let queue = Queue::new();
+    let mut sink = queue.sink();
+    let gadget = match await_gadget(
+        &state.backend,
+        &state.clock,
+        state.window,
+        &target,
+        Some(&alt),
+        &mut sink,
+    )
+    .await
+    {
+        Ok(gadget) => gadget,
+        Err(failure) => return Ok(Reply::failed("write", &failure.into_error())),
+    };
+
+    let image_len = u64::from(head.image_len);
+    let intake = Intake::new();
+    let mut crc = Crc32::new();
+    let written = {
+        let mut source = Crc32Source {
+            inner: intake.source(),
+            crc: &mut crc,
+        };
+        let io = Io {
+            intake: Some(&intake),
+            outbox: None,
+        };
+        pump_with(
+            conn,
+            Command::Write,
+            &queue,
+            io,
+            ops::write_from(&gadget.device, &state.clock, &alt, image_len, &mut source, &mut sink),
+        )
+        .await?
+    };
+    if let Err(error) = written {
+        return Ok(failure_reply(&error));
+    }
+
+    // The CRC and the optional verify byte follow the image.
+    let mut word = [0_u8; 4];
+    conn.payload(&mut word).await?;
+    let expected = u32::from_be_bytes(word);
+    let mut verify = [0_u8; 1];
+    let verify = if head.verify_follows {
+        conn.payload(&mut verify).await?;
+        verify != [0]
+    } else {
+        false
+    };
+    let actual = crc.finalize();
+    if actual != expected {
+        return Ok(Reply::Error(format!(
+            "{CRC_MISMATCH}: the image arrived with CRC32 0x{actual:08X}, not the 0x{expected:08X} sent after \
+             it, and was written as it arrived; write it again"
+        )));
+    }
+
+    if !verify {
+        return Ok(Reply::ok());
+    }
+    busy.switch(Activity::Verifying);
+    verify_by_crc(conn, &gadget.device, &state.clock, &alt, image_len, expected).await
+}
+
+/// A streamed write's verify: the image is gone, so the read-back is compared with the
+/// CRC the image came with, and a mismatch has no offset to name.
+async fn verify_by_crc<W, C, T>(
+    conn: &mut W,
+    device: &T,
+    clock: &C,
+    alt: &AltSel,
+    len: u64,
+    expected: u32,
+) -> Result<Reply, DaemonError>
+where
+    W: Wire,
+    C: Sleeper,
+    T: tdfu_usb::LocalUsbTransport,
+{
+    let queue = Queue::new();
+    let mut read_back = Crc32Sink(Crc32::new());
+    let verified = {
+        let mut sink = queue.sink();
+        pump(
+            conn,
+            Command::Write,
+            &queue,
+            ops::verify_with(device, clock, alt, len, &mut read_back, &mut sink),
+        )
+        .await?
+    };
+    if let Err(error) = verified {
+        return Ok(failure_reply(&error));
+    }
+    let read = read_back.0.finalize();
+    if read != expected {
+        return Ok(Reply::Error(format!(
+            "verify failed: the flash reads back with CRC32 0x{read:08X}, and the image's is 0x{expected:08X}"
+        )));
+    }
+    conn.log(&ops::matched_note(len)).await?;
+    Ok(Reply::ok())
+}
+
+/// A streamed `WRITE`'s fields up to its image.
+#[derive(Debug)]
+struct Head {
+    index: u8,
+    variant: Vec<u8>,
+    alt: Vec<u8>,
+    image_len: u32,
+    /// Whether the verify byte follows the CRC.
+    verify_follows: bool,
+}
+
+impl Head {
+    /// `[idx][vlen][variant][alen][alt][image_len]`, refused as [`Request::decode`]
+    /// refuses it, and the image, its CRC and the verify byte checked against what the
+    /// payload has left. The fields read come back too, kept, for [`run_whole`].
+    async fn read<W: Wire>(conn: &mut W, len: u64) -> Result<(Self, Fields), Refusal> {
+        let mut fields = Fields::keeping(len);
+        let (index, variant) = fields.index_and_variant(conn).await?;
+        if fields.left() == 0 {
+            return Err(Refusal::Payload("missing alt field"));
+        }
+        let alt = fields.length_prefixed(conn, "bad alt length").await?;
+        let image_len = fields.be32(conn, "missing firmware length").await?;
+        // The image and its CRC are tested together, as the decoder and the C test them
+        // (`dfu-remote/main.c:485`).
+        let Some(tail) = fields.left().checked_sub(u64::from(image_len) + 4) else {
+            return Err(Refusal::Payload("firmware data truncated"));
+        };
+        if tail > 1 {
+            return Err(Refusal::Payload("trailing bytes"));
+        }
+        let head = Self {
+            index,
+            variant,
+            alt,
+            image_len,
+            verify_follows: tail == 1,
+        };
+        Ok((head, fields))
+    }
+}
+
+/// A source that keeps the CRC of what passes through it: the image's own, computed on
+/// the way to the device, for the CRC that follows it on the wire.
+struct Crc32Source<'a, S> {
+    inner: S,
+    crc: &'a mut Crc32,
+}
+
+impl<S: AsyncSource> AsyncSource for Crc32Source<'_, S> {
+    async fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        self.inner.read_exact(buf).await?;
+        self.crc.update(buf);
+        Ok(())
+    }
+}
+
+/// A sink that keeps only a CRC: a streamed write's verify read-back.
+struct Crc32Sink(Crc32);
+
+impl AsyncSink for Crc32Sink {
+    async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.0.update(data);
+        Ok(())
+    }
+}
+
 /// The two failure shapes: a verify has its own string, everything else is
 /// `"write failed: <cause>"`.
 fn failure_reply(error: &Error) -> Reply {
@@ -248,10 +468,12 @@ fn wait_message(doing: &str, failure: super::device::WaitFailure) -> String {
 #[cfg(test)]
 mod tests {
     use super::{CRC_MISMATCH, wait_message};
+    use crate::commands::Wire as _;
     use crate::commands::device::WaitFailure;
     use crate::commands::fake::{FakeBackend, LoopbackConn, Sent, TestResult};
-    use crate::commands::fake::{dispatch, seen};
+    use crate::commands::fake::{dispatch, dispatch_streamed, seen};
     use crate::commands::state::{Activity, DaemonState, Window};
+    use crate::errors::DaemonError;
     use tdfu_core::clock::RecordingClock;
     use tdfu_proto::{Command, ERASE_ALT, ERASE_TOKEN, Request, Status, crc32};
     use tdfu_usb::gadget::{Fault, When};
@@ -901,6 +1123,189 @@ mod tests {
             "the operator was told the gadget was reset: {:?}",
             conn.log_lines()
         );
+        Ok(())
+    }
+
+    // ------------------------------------------------------------ streamed
+
+    /// An image with no pattern a block boundary could hide in.
+    fn pattern(len: u32) -> Vec<u8> {
+        (0..len).map(|at| (at % 251) as u8).collect()
+    }
+
+    /// **A streamed `WRITE` lands the same bytes a whole one does**, with the daemon
+    /// never holding more than a block of them.
+    #[test]
+    fn a_streamed_write_lands_the_image() -> TestResult {
+        let image = pattern(20_000);
+        let payload = write_request(b"flash", &image, None).encode()?;
+        let mut state = daemon(FakeBackend::new(vec![FakeBackend::gadget()])).with_stream_above(1024);
+        block_on(seen(&mut state))?;
+        let mut conn = LoopbackConn::raw().watching(state.watch());
+        block_on(dispatch_streamed(&mut conn, &mut state, Command::Write, &payload))?;
+        assert_eq!(
+            conn.response(),
+            Some((Status::Ok, b"OK".to_vec())),
+            "{:?}",
+            conn.error_text()
+        );
+        assert_eq!(conn.drained(), 0, "the handler read the whole payload itself");
+        let gadget = state.backend.gadget_at(0).ok_or("row 0 is the emulator")?;
+        let medium = gadget.medium(0).ok_or("alt 0 has a medium")?;
+        assert_eq!(&medium[..image.len()], image.as_slice());
+        assert!(
+            conn.log_lines().iter().any(|line| line == "Write complete"),
+            "{:?}",
+            conn.log_lines()
+        );
+        assert!(conn.activities().contains(&Activity::Writing));
+        assert_eq!(state.activity(), Activity::Idle);
+        Ok(())
+    }
+
+    /// With the verify byte set, the read-back is compared by CRC, the image being gone,
+    /// under `verifying`, and the match is announced as a whole write's is.
+    #[test]
+    fn a_streamed_write_verifies_by_crc() -> TestResult {
+        let image = pattern(20_000);
+        let payload = write_request(b"flash", &image, Some(true)).encode()?;
+        let mut state = daemon(FakeBackend::new(vec![FakeBackend::gadget()])).with_stream_above(1024);
+        block_on(seen(&mut state))?;
+        let mut conn = LoopbackConn::raw().watching(state.watch());
+        block_on(dispatch_streamed(&mut conn, &mut state, Command::Write, &payload))?;
+        assert_eq!(
+            conn.response(),
+            Some((Status::Ok, b"OK".to_vec())),
+            "{:?}",
+            conn.error_text()
+        );
+        assert!(conn.activities().contains(&Activity::Verifying));
+        assert!(
+            conn.log_lines()
+                .iter()
+                .any(|line| line == "Verify OK: 20000 bytes match"),
+            "{:?}",
+            conn.log_lines()
+        );
+        Ok(())
+    }
+
+    /// A CRC that does not match the image is refused, after the fact, and the answer
+    /// says the flash was written: the image went out as it arrived.
+    #[test]
+    fn a_streamed_write_with_the_wrong_crc_says_it_was_written() -> TestResult {
+        let image = pattern(20_000);
+        let mut request = write_request(b"flash", &image, Some(true));
+        if let Request::Write { crc32: value, .. } = &mut request {
+            *value ^= 1;
+        }
+        let mut state = daemon(FakeBackend::new(vec![FakeBackend::gadget()])).with_stream_above(1024);
+        block_on(seen(&mut state))?;
+        let mut conn = LoopbackConn::raw();
+        block_on(dispatch_streamed(
+            &mut conn,
+            &mut state,
+            Command::Write,
+            &request.encode()?,
+        ))?;
+        let message = conn.error_text().ok_or("the write must be refused")?;
+        assert!(message.starts_with(CRC_MISMATCH), "{message}");
+        assert!(message.contains("written as it arrived"), "{message}");
+        assert!(
+            !conn.log_lines().iter().any(|line| line.starts_with("Verify OK")),
+            "no verify runs against a CRC already refused"
+        );
+        Ok(())
+    }
+
+    /// **Every malformed layout is refused as the decoder refuses it**, in the same
+    /// words, before the bus is touched, and the rest of the payload is read and
+    /// dropped so the connection stays in step.
+    #[test]
+    fn a_streamed_write_refuses_what_the_decoder_refuses() -> TestResult {
+        let good = write_request(b"flash", &pattern(5000), Some(true)).encode()?;
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("payload too short", vec![0]),
+            ("bad variant length", [&[0_u8, 250][..], &[0; 10]].concat()),
+            ("missing alt field", vec![0, 0]),
+            ("bad alt length", [&[0_u8, 0, 200][..], &[0; 10]].concat()),
+            (
+                "missing firmware length",
+                [&[0_u8, 0, 5][..], b"flash", &[0, 0]].concat(),
+            ),
+            ("firmware data truncated", good[..good.len() - 3].to_vec()),
+            ("trailing bytes", [&good[..], &[0, 0]].concat()),
+        ];
+        for (words, payload) in cases {
+            let mut whole = LoopbackConn::raw();
+            let mut state = daemon(FakeBackend::new(vec![FakeBackend::gadget()]));
+            block_on(seen(&mut state))?;
+            block_on(dispatch(&mut whole, &mut state, Command::Write, &payload))?;
+            assert_eq!(whole.error_text().as_deref(), Some(words), "read whole");
+
+            let mut streamed = LoopbackConn::raw();
+            let mut state = daemon(FakeBackend::new(vec![FakeBackend::gadget()])).with_stream_above(0);
+            block_on(seen(&mut state))?;
+            block_on(dispatch_streamed(&mut streamed, &mut state, Command::Write, &payload))?;
+            assert_eq!(streamed.error_text().as_deref(), Some(words), "streamed");
+            assert!(state.backend.opened().is_empty(), "{words}: the bus was touched");
+            assert_eq!(streamed.payload_left(), 0, "{words}: the rest was not read");
+        }
+        Ok(())
+    }
+
+    /// **An image small enough to hold takes the whole-payload path**, CRC ahead of the
+    /// flash: a payload just over the limit because of its fields is not worth giving
+    /// that up for.
+    #[test]
+    fn a_streamed_write_of_a_small_image_checks_its_crc_first() -> TestResult {
+        let image = vec![0x11_u8; 1000];
+        let mut request = write_request(b"flash", &image, None);
+        if let Request::Write { crc32: value, .. } = &mut request {
+            *value ^= 1;
+        }
+        let payload = request.encode()?;
+        assert!(payload.len() > 1000, "the payload is over the limit, the image is not");
+        let mut state = daemon(FakeBackend::new(vec![FakeBackend::gadget()])).with_stream_above(1000);
+        block_on(seen(&mut state))?;
+        let mut conn = LoopbackConn::raw();
+        block_on(dispatch_streamed(&mut conn, &mut state, Command::Write, &payload))?;
+        assert_eq!(
+            conn.sent(),
+            vec![Sent::Response(Status::Error, CRC_MISMATCH.as_bytes().to_vec())]
+        );
+        assert!(state.backend.opened().is_empty(), "refused before the bus");
+        Ok(())
+    }
+
+    /// The wipe token is seventeen bytes, so it always takes that path, and it still
+    /// erases however small the limit.
+    #[test]
+    fn a_streamed_erase_token_still_erases() -> TestResult {
+        let payload = write_request(ERASE_ALT, ERASE_TOKEN, None).encode()?;
+        let backend = FakeBackend::new(vec![FakeBackend::gadget_holding(&[0x5A; 4096])]);
+        let mut state = daemon(backend).with_stream_above(20);
+        block_on(seen(&mut state))?;
+        let mut conn = LoopbackConn::raw();
+        block_on(dispatch_streamed(&mut conn, &mut state, Command::Write, &payload))?;
+        assert_eq!(conn.response(), Some((Status::Ok, b"OK".to_vec())));
+        let gadget = state.backend.gadget_at(0).ok_or("row 0 is the emulator")?;
+        assert_eq!(gadget.erases(), 1, "the real erase path ran");
+        Ok(())
+    }
+
+    /// A client that stops sending part-way through the image ends the connection, and
+    /// the daemon is idle and ready for the next one.
+    #[test]
+    fn a_client_that_stops_mid_image_leaves_the_daemon_idle() -> TestResult {
+        let payload = write_request(b"flash", &pattern(20_000), None).encode()?;
+        let mut state = daemon(FakeBackend::new(vec![FakeBackend::gadget()])).with_stream_above(1024);
+        block_on(seen(&mut state))?;
+        let mut conn = LoopbackConn::raw().stopping_after(9000);
+        let outcome = block_on(dispatch_streamed(&mut conn, &mut state, Command::Write, &payload));
+        assert!(matches!(outcome, Err(DaemonError::Truncated { .. })), "{outcome:?}");
+        assert!(conn.response().is_none(), "nobody is left to answer");
+        assert_eq!(state.activity(), Activity::Idle);
         Ok(())
     }
 }
