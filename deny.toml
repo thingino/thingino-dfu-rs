@@ -14,6 +14,9 @@ targets = [
     "aarch64-apple-darwin",
     "wasm32-unknown-unknown",
     "aarch64-linux-android",
+    # The dev backpack's firmware links tdfu-usb's ESP-IDF backend, which brings
+    # esp-idf-sys and the build tooling that compiles ESP-IDF.
+    "xtensa-esp32s3-espidf",
 ]
 all-features = true
 
@@ -68,6 +71,13 @@ skip = [
     # the cost of its API redesign - a trade worth revisiting deliberately.
     { crate = "thiserror", reason = "jni 0.21 pulls thiserror 1 alongside the workspace's thiserror 2; Android-only" },
     { crate = "thiserror-impl", reason = "the proc-macro half of the thiserror-1/2 split above" },
+]
+# esp-idf-sys compiles ESP-IDF with embuild, bindgen and cmake: build tooling for the dev
+# backpack's firmware that runs on the build machine and is linked into nothing it ships.
+# It lags the workspace's own crates in thirteen places (bitflags 1, toml 0.8, winnow,
+# rustix, ...), and one entry for its tree says so once instead of thirteen times.
+skip-tree = [
+    { crate = "esp-idf-sys", reason = "ESP-IDF build tooling for the backpack firmware; runs on the build host, ships in nothing" },
 ]
 
 [sources]
