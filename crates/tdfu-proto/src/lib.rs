@@ -22,6 +22,7 @@
 pub mod crc;
 pub mod error;
 pub mod frame;
+pub mod info;
 pub mod progress;
 pub mod request;
 pub mod variant;
@@ -29,6 +30,7 @@ pub mod variant;
 pub use crc::{Crc32, crc32};
 pub use error::ProtoError;
 pub use frame::{Command, HEADER_LEN, RequestHeader, ResponseHeader, Status, exceeds_payload_cap};
+pub use info::{DaemonInfo, Loaders};
 pub use progress::ProgressBody;
 pub use request::{Blobs, DeviceEntry, ERASE_ALT, ERASE_TOKEN, Request};
 pub use variant::WireVariant;

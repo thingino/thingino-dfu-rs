@@ -25,6 +25,8 @@ pub enum Request {
     Discover,
     /// Ask for the daemon's protocol narration on this connection. Header-only.
     Debug,
+    /// Ask what the daemon is. Header-only.
+    Info,
     /// Bring the device at `index` up as a gadget.
     Bootstrap {
         /// Device index from the last `DISCOVER`.
@@ -84,6 +86,7 @@ impl Request {
         match self {
             Self::Discover => Command::Discover,
             Self::Debug => Command::Debug,
+            Self::Info => Command::Info,
             Self::Bootstrap { .. } => Command::Bootstrap,
             Self::Write { .. } => Command::Write,
             Self::Read { .. } => Command::Read,
@@ -112,7 +115,7 @@ impl Request {
     pub fn encode(&self) -> Result<Vec<u8>, ProtoError> {
         let mut out = Vec::new();
         match self {
-            Self::Discover | Self::Status | Self::Cancel | Self::Debug => {}
+            Self::Discover | Self::Status | Self::Cancel | Self::Debug | Self::Info => {}
             Self::Bootstrap { index, variant, blobs } => {
                 out.push(*index);
                 push_u8_prefixed(&mut out, "variant", variant)?;
@@ -170,6 +173,7 @@ impl Request {
         let request = match command {
             Command::Discover => Self::Discover,
             Command::Debug => Self::Debug,
+            Command::Info => Self::Info,
             Command::Status => Self::Status,
             Command::Cancel => Self::Cancel,
             Command::Bootstrap => {

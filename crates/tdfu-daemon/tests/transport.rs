@@ -935,9 +935,9 @@ async fn rpc_unknown_command_is_refused_and_the_connection_continues() -> TestRe
     let (address, server) = serve(Auth::open(), brisk(), 1, Reply::Plain);
     let mut client = TcpStream::connect(address).await?;
 
-    // Command 0x0A does not exist (0x09 became `CMD_DEBUG`), and it claims a payload
+    // Command 0x7F does not exist (0x09 became `CMD_DEBUG` and 0x0A `CMD_INFO`), and it claims a payload
     // that must be skipped exactly.
-    client.write_all(&frame(0x0A, b"payload-to-skip")).await?;
+    client.write_all(&frame(0x7F, b"payload-to-skip")).await?;
     let (status, payload) = response(&mut client).await?;
     assert_eq!(status, Status::Error.wire_byte());
     assert_eq!(payload, b"unknown command");
@@ -986,7 +986,7 @@ async fn a_skipped_payload_larger_than_one_chunk_is_skipped_exactly() -> TestRes
 
     // 40 KiB is three passes of the 16 KiB scratch buffer, the last one partial.
     let bulk = vec![0x5A_u8; 40 * 1024];
-    client.write_all(&frame(0x0A, &bulk)).await?;
+    client.write_all(&frame(0x7F, &bulk)).await?;
     let (status, payload) = response(&mut client).await?;
     assert_eq!(
         (status, payload.as_slice()),
@@ -1022,8 +1022,8 @@ async fn a_truncated_skip_reports_everything_it_skipped() -> TestResult {
     let (address, server) = serve(Auth::open(), brisk(), 1, Reply::Plain);
     let mut client = TcpStream::connect(address).await?;
 
-    // Command 0x0A does not exist, so the announced payload is skipped rather than read.
-    client.write_all(&header_claiming(0x0A, 40_000)).await?;
+    // Command 0x7F does not exist, so the announced payload is skipped rather than read.
+    client.write_all(&header_claiming(0x7F, 40_000)).await?;
     client.write_all(&vec![0x5A_u8; 20_000]).await?;
     client.shutdown().await?;
 
@@ -2169,7 +2169,7 @@ async fn an_unknown_command_over_http_is_answered_once() -> TestResult {
     let (address, server) = serve(Auth::open(), brisk(), 1, Reply::Plain);
     let mut client = TcpStream::connect(address).await?;
     // An unknown command, and then trailing bytes a second read would trip over.
-    let mut body = frame(0x0A, b"skip me");
+    let mut body = frame(0x7F, b"skip me");
     body.extend_from_slice(&frame(Command::Status.wire_byte(), b""));
     post(&mut client, &body, None).await?;
 

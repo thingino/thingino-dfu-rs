@@ -6,8 +6,9 @@ use crate::error::ProtoError;
 /// (1) + `payload_len` (4).
 pub const HEADER_LEN: usize = 10;
 
-/// The nine commands: the C's eight at protocol version 1, and `Debug`, added so a client
-/// can ask for the daemon's protocol narration over the wire.
+/// The ten commands: the C's eight at protocol version 1; `Debug`, added so a client can
+/// ask for the daemon's protocol narration over the wire; and `Info`, so it can ask what
+/// the daemon is.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -36,11 +37,15 @@ pub enum Command {
     /// for that one request. A daemon that predates it answers "unknown command", which a
     /// client treats as "no narration from this daemon" and nothing worse.
     Debug = 9,
+    /// What is this daemon? Header-only; the answer is [`DaemonInfo`](crate::DaemonInfo).
+    /// A daemon that predates it answers "unknown command", which a client reads as "one
+    /// with a loader tree", which every daemon before it was.
+    Info = 10,
 }
 
 impl Command {
     /// Every command, for exhaustive tests.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Discover,
         Self::Bootstrap,
         Self::Write,
@@ -50,6 +55,7 @@ impl Command {
         Self::Diag,
         Self::Reboot,
         Self::Debug,
+        Self::Info,
     ];
 
     /// The wire byte.
@@ -74,6 +80,7 @@ impl Command {
             7 => Self::Diag,
             8 => Self::Reboot,
             9 => Self::Debug,
+            10 => Self::Info,
             _ => return Err(ProtoError::UnknownCommand),
         })
     }
@@ -493,7 +500,12 @@ mod tests {
             assert_eq!(Command::from_wire_byte(command.wire_byte())?, command);
         }
         assert!(Command::from_wire_byte(0).is_err(), "0 is not a command");
-        assert!(Command::from_wire_byte(10).is_err(), "10 is not a command yet");
+        assert_eq!(
+            Command::from_wire_byte(10)?,
+            Command::Info,
+            "10 asks what the daemon is"
+        );
+        assert!(Command::from_wire_byte(11).is_err(), "11 is not a command yet");
         Ok(())
     }
 
