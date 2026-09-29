@@ -20,7 +20,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "2.0.1"       # AGENTS.md D6; bumping it is docs/release.md step 1
+version = "2.1.0"       # AGENTS.md D6; bumping it is docs/release.md step 1
 edition = "2024"
 rust-version = "1.88"
 license = "GPL-2.0-or-later"
@@ -47,9 +47,9 @@ panic = "deny"
 module_name_repetitions = "allow"  # the curated allow-list lives HERE, never inline
 
 [workspace.dependencies]
-tdfu-core = { path = "crates/tdfu-core", version = "2.0.1" }
-tdfu-proto = { path = "crates/tdfu-proto", version = "2.0.1" }
-tdfu-usb = { path = "crates/tdfu-usb", version = "2.0.1" }
+tdfu-core = { path = "crates/tdfu-core", version = "2.1.0" }
+tdfu-proto = { path = "crates/tdfu-proto", version = "2.1.0" }
+tdfu-usb = { path = "crates/tdfu-usb", version = "2.1.0" }
 thiserror = { version = "2", default-features = false, features = ["std"] }
 
 # The Android JNI bridge. The classic, stable jni 0.21 API - `JNIEnv`, `GlobalRef`,
