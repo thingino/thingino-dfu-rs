@@ -80,6 +80,10 @@ pub struct EspTransport {
     idf_claimed: Cell<Option<u8>>,
     /// Replaced on `reset`, so a deferred old handle keeps its own count.
     ep0_inflight: RefCell<Arc<AtomicUsize>>,
+    /// The bulk transfer, allocated at the first bulk call and kept until `close`. Its
+    /// buffer is a [`CHUNK`] of DMA memory in one block: allocated once per opening, a
+    /// heap too fragmented for another block that size cannot fail an image halfway.
+    bulk: RefCell<Option<Transfer>>,
 }
 
 impl fmt::Debug for EspTransport {
@@ -103,6 +107,7 @@ impl EspTransport {
             claim: RefCell::new(None),
             idf_claimed: Cell::new(handle.idf_claimed),
             ep0_inflight: RefCell::new(handle.ep0_inflight),
+            bulk: RefCell::new(None),
         }
     }
 
@@ -163,6 +168,109 @@ impl EspTransport {
         cancel_endpoint(self.dev(), endpoint.address());
     }
 
+    /// The kept bulk transfer, or the first one.
+    fn take_bulk(&self, pipe: Pipe) -> Result<Transfer, UsbError> {
+        match self.bulk.borrow_mut().take() {
+            Some(transfer) => Ok(transfer),
+            None => Transfer::alloc(CHUNK, pipe, None),
+        }
+    }
+
+    /// Keeps `transfer` for the next bulk call, unless it was abandoned in flight.
+    fn keep_bulk(&self, transfer: Transfer) {
+        if transfer.owned() {
+            *self.bulk.borrow_mut() = Some(transfer);
+        }
+    }
+
+    async fn bulk_out_with(
+        &self,
+        transfer: &mut Transfer,
+        endpoint: BulkEndpoint,
+        data: &[u8],
+        timeout: Duration,
+    ) -> Result<usize, UsbError> {
+        let pipe = Pipe::Bulk(endpoint);
+        let mut sent = 0;
+        for chunk in data.chunks(CHUNK) {
+            yield_now().await;
+            transfer.buffer()[..chunk.len()].copy_from_slice(chunk);
+            transfer.prepare(self.dev(), endpoint.address(), chunk.len(), pipe)?;
+            // SAFETY: the transfer is prepared, owned, and not in flight; the library takes
+            // it until the completion callback runs.
+            let submitted =
+                transfer.submit_and_wait(|raw| unsafe { sys::usb_host_transfer_submit(raw) }, timeout, pipe);
+            if let Err(err) = submitted {
+                self.cancel(endpoint);
+                // Progress already made is reported as such, so the retry resumes after it.
+                return Err(if sent > 0 {
+                    UsbError::new(
+                        UsbErrorKind::Short {
+                            got: sent,
+                            want: data.len(),
+                        },
+                        pipe,
+                    )
+                } else {
+                    err
+                });
+            }
+            status_error(transfer.status(), pipe).map_err(|err| err.with_transferred(sent))?;
+            sent += transfer.actual();
+            if transfer.actual() < chunk.len() {
+                return Err(UsbError::new(
+                    UsbErrorKind::Short {
+                        got: sent,
+                        want: data.len(),
+                    },
+                    pipe,
+                ));
+            }
+        }
+        Ok(sent)
+    }
+
+    async fn bulk_in_with(
+        &self,
+        transfer: &mut Transfer,
+        (endpoint, mps): (BulkEndpoint, usize),
+        len: usize,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, UsbError> {
+        let pipe = Pipe::Bulk(endpoint);
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            yield_now().await;
+            let want = (len - out.len()).min(CHUNK);
+            // At most CHUNK, which is a multiple of every bulk max packet size.
+            let request = want.div_ceil(mps) * mps;
+            transfer.prepare(self.dev(), endpoint.address(), request, pipe)?;
+            // SAFETY: as in `bulk_out_with`.
+            let submitted =
+                transfer.submit_and_wait(|raw| unsafe { sys::usb_host_transfer_submit(raw) }, timeout, pipe);
+            if let Err(err) = submitted {
+                self.cancel(endpoint);
+                return Err(err);
+            }
+            status_error(transfer.status(), pipe)?;
+            let got = transfer.actual().min(want);
+            out.extend_from_slice(&transfer.buffer()[..got]);
+            if got < want {
+                break;
+            }
+        }
+        if out.len() < len {
+            return Err(UsbError::new(
+                UsbErrorKind::Short {
+                    got: out.len(),
+                    want: len,
+                },
+                pipe,
+            ));
+        }
+        Ok(out)
+    }
+
     fn claim_idf(&self, interface: u8) -> Result<(), UsbError> {
         // SAFETY: the handle is open for this client.
         let err = unsafe { sys::usb_host_interface_claim(self.shared.client(), self.dev(), interface, 0) };
@@ -199,6 +307,7 @@ impl EspTransport {
         let dev = self.dev();
         let ep0_inflight = Arc::clone(&self.ep0_inflight.borrow());
         self.claim.borrow_mut().take();
+        self.bulk.borrow_mut().take();
         if ep0_inflight.load(Ordering::SeqCst) == 0 && !self.shared.is_gone(dev) {
             self.shared.park(Handle {
                 dev: Raw(dev),
@@ -320,83 +429,20 @@ impl LocalUsbTransport for EspTransport {
         let Some((endpoint, _)) = self.claimed().and_then(|claim| claim.bulk_out) else {
             return Err(Self::not_claimed(Pipe::Device));
         };
-        let pipe = Pipe::Bulk(endpoint);
-        let mut sent = 0;
-        for chunk in data.chunks(CHUNK) {
-            yield_now().await;
-            let mut transfer = Transfer::alloc(chunk.len(), pipe, None)?;
-            transfer.buffer()[..chunk.len()].copy_from_slice(chunk);
-            transfer.prepare(self.dev(), endpoint.address(), chunk.len(), pipe)?;
-            // SAFETY: the transfer is prepared, owned, and not in flight; the library takes
-            // it until the completion callback runs.
-            let submitted =
-                transfer.submit_and_wait(|raw| unsafe { sys::usb_host_transfer_submit(raw) }, timeout, pipe);
-            if let Err(err) = submitted {
-                self.cancel(endpoint);
-                // Progress already made is reported as such, so the retry resumes after it.
-                return Err(if sent > 0 {
-                    UsbError::new(
-                        UsbErrorKind::Short {
-                            got: sent,
-                            want: data.len(),
-                        },
-                        pipe,
-                    )
-                } else {
-                    err
-                });
-            }
-            status_error(transfer.status(), pipe).map_err(|err| err.with_transferred(sent))?;
-            sent += transfer.actual();
-            if transfer.actual() < chunk.len() {
-                return Err(UsbError::new(
-                    UsbErrorKind::Short {
-                        got: sent,
-                        want: data.len(),
-                    },
-                    pipe,
-                ));
-            }
-        }
-        Ok(sent)
+        let mut transfer = self.take_bulk(Pipe::Bulk(endpoint))?;
+        let sent = self.bulk_out_with(&mut transfer, endpoint, data, timeout).await;
+        self.keep_bulk(transfer);
+        sent
     }
 
     async fn bulk_in(&self, len: usize, timeout: Duration) -> Result<Vec<u8>, UsbError> {
         let Some((endpoint, mps)) = self.claimed().and_then(|claim| claim.bulk_in) else {
             return Err(Self::not_claimed(Pipe::Device));
         };
-        let pipe = Pipe::Bulk(endpoint);
-        let mut out = Vec::with_capacity(len);
-        while out.len() < len {
-            yield_now().await;
-            let want = (len - out.len()).min(CHUNK);
-            let request = want.div_ceil(mps) * mps;
-            let mut transfer = Transfer::alloc(request, pipe, None)?;
-            transfer.prepare(self.dev(), endpoint.address(), request, pipe)?;
-            // SAFETY: as in `bulk_out`.
-            let submitted =
-                transfer.submit_and_wait(|raw| unsafe { sys::usb_host_transfer_submit(raw) }, timeout, pipe);
-            if let Err(err) = submitted {
-                self.cancel(endpoint);
-                return Err(err);
-            }
-            status_error(transfer.status(), pipe)?;
-            let got = transfer.actual().min(want);
-            out.extend_from_slice(&transfer.buffer()[..got]);
-            if got < want {
-                break;
-            }
-        }
-        if out.len() < len {
-            return Err(UsbError::new(
-                UsbErrorKind::Short {
-                    got: out.len(),
-                    want: len,
-                },
-                pipe,
-            ));
-        }
-        Ok(out)
+        let mut transfer = self.take_bulk(Pipe::Bulk(endpoint))?;
+        let got = self.bulk_in_with(&mut transfer, (endpoint, mps), len, timeout).await;
+        self.keep_bulk(transfer);
+        got
     }
 
     async fn set_configuration(&self, value: u8) -> Result<(), UsbError> {

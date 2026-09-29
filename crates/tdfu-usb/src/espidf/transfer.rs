@@ -101,6 +101,9 @@ impl Transfer {
         timeout: Duration,
         pipe: Pipe,
     ) -> Result<(), UsbError> {
+        // A transfer is submitted again once its last submission completed, which left
+        // `Done` behind.
+        *self.completion.slot() = Slot::Waiting;
         let context = Arc::into_raw(Arc::clone(&self.completion));
         // SAFETY: the transfer is owned and not yet in flight.
         unsafe { (*self.raw).context = context.cast_mut().cast::<c_void>() };
@@ -141,6 +144,12 @@ impl Transfer {
     pub(super) fn actual(&self) -> usize {
         // SAFETY: as for `status`.
         usize::try_from(unsafe { (*self.raw).actual_num_bytes }).unwrap_or(0)
+    }
+
+    /// Whether this is still the caller's to submit again: an abandoned transfer is its
+    /// callback's to free.
+    pub(super) fn owned(&self) -> bool {
+        self.owned
     }
 }
 
