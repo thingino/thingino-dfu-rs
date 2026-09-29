@@ -27,7 +27,9 @@ Each one has already cost real time or real hardware.
 5. **No `unwrap`, `expect`, or `panic!` in library crates.** CI denies them. A flashing
    tool must not abort mid-write on a lazy unwrap.
 6. **No `async_trait` crate. No Emscripten. No `libusb` C dependency.** `nusb` is the
-   native backend, proven on hardware and needing no `unsafe`; the browser drives WebUSB.
+   native backend, proven on hardware and needing no `unsafe`; the browser drives WebUSB;
+   the ESP32-S3 dev backpack drives the ESP-IDF USB Host Library (`tdfu_usb::espidf`), the
+   one backend with `unsafe`, confined to its FFI edge.
 7. **Do not invent interfaces.** The traits and the types the crates exchange are frozen.
    If one is wrong, say so with the change you propose rather than applying it
    unilaterally: something else is being built against the same interface.
@@ -65,6 +67,11 @@ Each one has already cost real time or real hardware.
   and the browser crate's largest module and its Node tests are linted only on the target.
   A change to the page also runs `npm --prefix web test`; a change to the Android drop-in
   also builds `cargo build --locked --release --target aarch64-linux-android -p tdfu-jni`.
+  A change to `tdfu-usb` also runs its clippy for the ESP32-S3, which the host lint compiles
+  away: `cargo +esp clippy --locked -p tdfu-usb --target xtensa-esp32s3-espidf
+  -Zbuild-std=std,panic_abort --all-features -- -D warnings`, with the Xtensa toolchain,
+  `IDF_PATH` at ESP-IDF v5.5.5, `MCU=esp32s3` and `--cfg espidf_time64` in that target's
+  rustflags (`.github/workflows/espidf.yml` pins and caches all of it).
   A tag runs the whole gate before anything is built, so an ungated commit cannot ship.
 
 ### 2.1 The pre-push hook, enable it in every clone
