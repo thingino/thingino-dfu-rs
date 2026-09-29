@@ -201,6 +201,12 @@ pub enum DaemonError {
     /// A frame could not be encoded.
     #[error("could not encode a frame: {0}")]
     Encode(#[from] tdfu_proto::ProtoError),
+
+    /// A streamed payload or reply was used out of turn: read or written past its end,
+    /// ended short, or interrupted by another frame. A defect on this side, and the
+    /// connection ends, because the peer's framing can no longer be trusted.
+    #[error("streamed message used out of turn: {0}")]
+    Stream(&'static str),
 }
 
 impl DaemonError {

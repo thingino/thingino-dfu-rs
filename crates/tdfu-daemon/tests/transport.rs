@@ -14,7 +14,7 @@ use core::net::SocketAddr;
 use core::time::Duration;
 
 use tdfu_daemon::auth::Auth;
-use tdfu_daemon::transport::{Conn, Origins, Timeouts};
+use tdfu_daemon::transport::{Conn, DaemonError, Incoming, Origins, Timeouts};
 use tdfu_proto::{Command, HEADER_LEN, MAGIC, MAX_PAYLOAD, ProgressBody, Status, VERSION};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
@@ -2360,6 +2360,11 @@ async fn a_body_that_never_finishes_hits_the_whole_transfer_deadline() -> TestRe
     client
         .write_all(b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4096\r\n\r\n")
         .await?;
+    // The frame header arrives at once, so what is under the budget is the payload: the
+    // body is read as the command asks for it, and a header that did not parse would be
+    // refused as soon as its ten bytes were in.
+    let whole = frame(Command::Write.wire_byte(), &[0_u8; 4096 - 10]);
+    client.write_all(whole.get(..10).ok_or("a frame has a header")?).await?;
 
     let started = std::time::Instant::now();
     let dribble = async {
@@ -2695,5 +2700,307 @@ async fn rpc_log_frames_when() -> TestResult {
         "HTTP attaches for every command"
     );
     let _events = server.await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Streamed payloads and replies
+// ---------------------------------------------------------------------------
+
+/// A raw connection accepted from a client whose `request` is on its way, written by a
+/// task of its own so a request larger than the socket buffers cannot stall the test.
+/// The client comes back once the whole request is out.
+async fn raw_with(
+    request: Vec<u8>,
+) -> Result<(JoinHandle<std::io::Result<TcpStream>>, Conn), Box<dyn core::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let mut client = TcpStream::connect(listener.local_addr()?).await?;
+    let (stream, _) = listener.accept().await?;
+    let writer = tokio::spawn(async move {
+        client.write_all(&request).await?;
+        Ok(client)
+    });
+    let conn = Conn::accept_with(stream, &Auth::open(), brisk(), shipped())
+        .await?
+        .ok_or("no connection")?;
+    Ok((writer, conn))
+}
+
+/// **A payload over the limit stays on the socket.** A daemon with a few hundred
+/// kilobytes of RAM cannot hold a 16 MiB image: the request is handed over with its
+/// length, the command reads what it wants, and the final frame reads and drops the
+/// rest, so the next request on the connection starts where it should.
+#[tokio::test]
+async fn a_payload_over_the_limit_is_streamed_and_its_rest_skipped() -> TestResult {
+    let payload: Vec<u8> = (0..70_000_u32).map(|at| (at % 251) as u8).collect();
+    let mut request = frame(Command::Write.wire_byte(), &payload);
+    request.extend_from_slice(&frame(Command::Status.wire_byte(), b""));
+    let (writer, mut conn) = raw_with(request).await?;
+
+    assert_eq!(
+        conn.next_incoming(Some(1024)).await?,
+        Some(Incoming::Streamed(Command::Write, 70_000))
+    );
+    assert_eq!(conn.current(), Some(Command::Write));
+    let mut first = vec![0_u8; 1000];
+    conn.payload(&mut first).await?;
+    assert_eq!(first, payload[..1000]);
+    assert_eq!(conn.payload_left(), 69_000);
+    conn.respond(Status::Ok, b"OK").await?;
+    assert_eq!(conn.payload_left(), 0, "the final frame read the rest");
+
+    // The next header is the next request's, not a slice of the image.
+    assert_eq!(
+        conn.next_incoming(Some(1024)).await?,
+        Some(Incoming::Whole(Command::Status, Vec::new()))
+    );
+    conn.respond(Status::Ok, b"idle").await?;
+    let mut client = writer.await??;
+    assert_eq!(response(&mut client).await?, (Status::Ok.wire_byte(), b"OK".to_vec()));
+    assert_eq!(response(&mut client).await?, (Status::Ok.wire_byte(), b"idle".to_vec()));
+    Ok(())
+}
+
+/// A payload at the limit is read whole, and with no limit every payload is, which is
+/// what a daemon that did not ask for streaming gets.
+#[tokio::test]
+async fn a_payload_at_the_limit_is_read_whole() -> TestResult {
+    let mut request = frame(Command::Write.wire_byte(), &[7; 1024]);
+    request.extend_from_slice(&frame(Command::Write.wire_byte(), &[8; 5000]));
+    let (_writer, mut conn) = raw_with(request).await?;
+    assert_eq!(
+        conn.next_incoming(Some(1024)).await?,
+        Some(Incoming::Whole(Command::Write, vec![7; 1024]))
+    );
+    conn.respond(Status::Ok, b"OK").await?;
+    assert_eq!(
+        conn.next_incoming(None).await?,
+        Some(Incoming::Whole(Command::Write, vec![8; 5000]))
+    );
+    Ok(())
+}
+
+/// Reading past the announced payload is this side's mistake. It is refused, and it
+/// takes nothing, rather than reading into the next request.
+#[tokio::test]
+async fn a_streamed_payload_cannot_be_read_past_its_end() -> TestResult {
+    let mut request = frame(Command::Write.wire_byte(), &[1; 2000]);
+    request.extend_from_slice(&frame(Command::Status.wire_byte(), b""));
+    let (_writer, mut conn) = raw_with(request).await?;
+    assert_eq!(
+        conn.next_incoming(Some(100)).await?,
+        Some(Incoming::Streamed(Command::Write, 2000))
+    );
+    let mut too_much = vec![0_u8; 2001];
+    let refused = conn.payload(&mut too_much).await;
+    assert!(matches!(refused, Err(DaemonError::Stream(_))), "{refused:?}");
+    assert_eq!(conn.payload_left(), 2000, "nothing was taken");
+    Ok(())
+}
+
+/// A peer that stops part-way through a streamed payload is a truncation, and the
+/// numbers are the whole payload's, not the last read's.
+#[tokio::test]
+async fn a_streamed_payload_cut_short_says_how_far_it_got() -> TestResult {
+    let mut request = header_claiming(Command::Write.wire_byte(), 5000);
+    request.extend_from_slice(&[0; 3000]);
+    let (writer, mut conn) = raw_with(request).await?;
+    assert_eq!(
+        conn.next_incoming(Some(100)).await?,
+        Some(Incoming::Streamed(Command::Write, 5000))
+    );
+    let mut first = vec![0_u8; 2000];
+    conn.payload(&mut first).await?;
+    drop(writer.await??);
+    let mut rest = vec![0_u8; 3000];
+    match conn.payload(&mut rest).await {
+        Err(DaemonError::Truncated { doing, got, want }) => {
+            assert_eq!((doing, got, want), ("payload", 3000, 5000));
+        }
+        other => return Err(format!("expected a truncation, got {other:?}").into()),
+    }
+    Ok(())
+}
+
+/// **A reply can stream too**, and on every transport it is the same bytes as the reply
+/// written whole: this is how a `READ` sends a flash without holding it.
+#[tokio::test]
+async fn a_streamed_reply_is_the_same_frame_on_every_transport() -> TestResult {
+    async fn stream_abcdef(conn: &mut Conn) -> Result<(), DaemonError> {
+        conn.begin_reply(Status::Ok, 6).await?;
+        conn.reply_body(b"abc").await?;
+        conn.reply_body(b"").await?;
+        conn.reply_body(b"def").await?;
+        conn.end_reply().await
+    }
+
+    // Raw.
+    let (writer, mut conn) = raw_with(frame(Command::Read.wire_byte(), b"")).await?;
+    assert_eq!(
+        conn.next_incoming(None).await?,
+        Some(Incoming::Whole(Command::Read, Vec::new()))
+    );
+    stream_abcdef(&mut conn).await?;
+    assert_eq!(conn.current(), None, "the request is answered");
+    let mut client = writer.await??;
+    assert_eq!(
+        response(&mut client).await?,
+        (Status::Ok.wire_byte(), b"abcdef".to_vec())
+    );
+
+    // WebSocket: one binary frame, its whole length announced up front.
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let mut client = TcpStream::connect(listener.local_addr()?).await?;
+    let (stream, _) = listener.accept().await?;
+    let auth = Auth::open();
+    let (accepted, upgraded) = tokio::join!(
+        Conn::accept_with(stream, &auth, brisk(), shipped()),
+        WsClient::upgrade(&mut client)
+    );
+    let mut ws = upgraded?;
+    let mut conn = accepted?.ok_or("no websocket connection")?;
+    ws.send(&mut client, 0x2, &frame(Command::Read.wire_byte(), b""))
+        .await?;
+    assert_eq!(
+        conn.next_incoming(None).await?,
+        Some(Incoming::Whole(Command::Read, Vec::new()))
+    );
+    stream_abcdef(&mut conn).await?;
+    let (opcode, whole) = WsClient::next_frame(&mut client).await?;
+    assert_eq!(opcode, 0x2);
+    assert_eq!(whole.len(), HEADER_LEN + 6, "one frame carries the whole reply");
+    assert_eq!(whole.get(HEADER_LEN..), Some(&b"abcdef"[..]));
+
+    // HTTP: one chunk, then the terminator.
+    let mut client = TcpStream::connect(listener.local_addr()?).await?;
+    let (stream, _) = listener.accept().await?;
+    let read = frame(Command::Read.wire_byte(), b"");
+    let (accepted, posted) = tokio::join!(
+        Conn::accept_with(stream, &auth, brisk(), shipped()),
+        post(&mut client, &read, None)
+    );
+    posted?;
+    let mut conn = accepted?.ok_or("no http connection")?;
+    assert_eq!(
+        conn.next_incoming(None).await?,
+        Some(Incoming::Whole(Command::Read, Vec::new()))
+    );
+    stream_abcdef(&mut conn).await?;
+    drop(conn);
+    let raw = drain(&mut client).await?;
+    assert!(raw.ends_with(b"\r\n0\r\n\r\n"), "the body is terminated");
+    let (_, body) = unchunk(&raw)?;
+    assert_eq!(body.len(), HEADER_LEN + 6);
+    assert_eq!(body.get(5).copied(), Some(Status::Ok.wire_byte()));
+    assert_eq!(body.get(HEADER_LEN..), Some(&b"abcdef"[..]));
+    Ok(())
+}
+
+/// A streamed reply is exactly as long as it said: past it, short of it, or with another
+/// frame inside it, the framing would be wrong for the peer, so each is refused.
+#[tokio::test]
+async fn a_streamed_reply_keeps_to_its_length() -> TestResult {
+    let (_writer, mut conn) = raw_with(frame(Command::Read.wire_byte(), b"")).await?;
+    let _request = conn.next_incoming(None).await?;
+    assert!(
+        matches!(conn.reply_body(b"x").await, Err(DaemonError::Stream(_))),
+        "no reply is open"
+    );
+    assert!(
+        matches!(conn.end_reply().await, Err(DaemonError::Stream(_))),
+        "no reply is open"
+    );
+
+    conn.begin_reply(Status::Ok, 4).await?;
+    assert!(matches!(
+        conn.begin_reply(Status::Ok, 4).await,
+        Err(DaemonError::Stream(_))
+    ));
+    assert!(
+        matches!(conn.reply_body(b"abcde").await, Err(DaemonError::Stream(_))),
+        "past it"
+    );
+    conn.reply_body(b"abc").await?;
+    assert!(
+        matches!(conn.end_reply().await, Err(DaemonError::Stream(_))),
+        "short of it"
+    );
+    assert!(
+        matches!(conn.log("a line").await, Err(DaemonError::Stream(_))),
+        "a log frame inside it"
+    );
+    assert!(matches!(
+        conn.respond(Status::Ok, b"OK").await,
+        Err(DaemonError::Stream(_))
+    ));
+    conn.reply_body(b"d").await?;
+    conn.end_reply().await?;
+    Ok(())
+}
+
+/// The cap applies to a streamed reply as to a whole one: refused for any command but
+/// `READ`, whose answer is a whole flash, before a byte is written.
+#[tokio::test]
+async fn a_streamed_reply_over_the_cap_is_refused_unless_it_is_a_read() -> TestResult {
+    let mut request = frame(Command::Status.wire_byte(), b"");
+    request.extend_from_slice(&frame(Command::Read.wire_byte(), b""));
+    let (writer, mut conn) = raw_with(request).await?;
+    let over = u64::from(MAX_PAYLOAD) + 1;
+
+    let _status = conn.next_incoming(None).await?;
+    let refused = conn.begin_reply(Status::Ok, over).await;
+    assert!(
+        matches!(refused, Err(DaemonError::OversizeResponse { .. })),
+        "{refused:?}"
+    );
+    conn.respond(Status::Ok, b"idle").await?;
+
+    let _read = conn.next_incoming(None).await?;
+    conn.begin_reply(Status::Ok, over).await?;
+    let mut client = writer.await??;
+    assert_eq!(response(&mut client).await?, (Status::Ok.wire_byte(), b"idle".to_vec()));
+    let mut header = [0_u8; HEADER_LEN];
+    tokio::time::timeout(CLIENT_DEADLINE, client.read_exact(&mut header)).await??;
+    let announced = u32::from_be_bytes([header[6], header[7], header[8], header[9]]);
+    assert_eq!(u64::from(announced), over, "the header announces the whole of it");
+    Ok(())
+}
+
+/// **The HTTP body is read as the command asks for it**, so the browser flasher's image
+/// streams too, and an answer before the body is all read still reads the rest first:
+/// the browser sends its whole body before it looks at the response.
+#[tokio::test]
+async fn an_http_body_streams_and_is_drained_before_the_answer() -> TestResult {
+    let payload: Vec<u8> = (0..50_000_u32).map(|at| (at % 253) as u8).collect();
+    let body = frame(Command::Write.wire_byte(), &payload);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let mut client = TcpStream::connect(listener.local_addr()?).await?;
+    let (stream, _) = listener.accept().await?;
+    let auth = Auth::open();
+    let posting = tokio::spawn(async move {
+        let posted = post(&mut client, &body, None).await.map_err(|error| error.to_string());
+        posted.map(|()| client)
+    });
+    let mut conn = Conn::accept_with(stream, &auth, brisk(), shipped())
+        .await?
+        .ok_or("no http connection")?;
+    assert_eq!(
+        conn.next_incoming(Some(4096)).await?,
+        Some(Incoming::Streamed(Command::Write, 50_000))
+    );
+    let mut head = vec![0_u8; 20_000];
+    conn.payload(&mut head).await?;
+    assert_eq!(head, payload[..20_000]);
+    conn.respond(Status::Error, b"firmware CRC32 mismatch").await?;
+    assert_eq!(conn.payload_left(), 0);
+    assert_eq!(conn.next_incoming(Some(4096)).await?, None, "one command per POST");
+    drop(conn);
+
+    let mut client = posting.await??;
+    let raw = drain(&mut client).await?;
+    let (headers, reply) = unchunk(&raw)?;
+    assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"), "{headers}");
+    assert_eq!(reply.get(5).copied(), Some(Status::Error.wire_byte()));
+    assert_eq!(reply.get(HEADER_LEN..), Some(&b"firmware CRC32 mismatch"[..]));
     Ok(())
 }

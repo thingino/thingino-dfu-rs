@@ -53,6 +53,8 @@ pub struct WsConn {
     pub(super) current: Option<tdfu_proto::Command>,
     /// Has this connection asked for the protocol narration (`CMD_DEBUG`)?
     pub(super) narrate: bool,
+    /// The request payload or reply being streamed, if either is.
+    pub(super) streams: super::Streams,
 }
 
 impl WsConn {
@@ -131,6 +133,7 @@ impl WsConn {
             mask_at: 0,
             current: None,
             narrate: false,
+            streams: super::Streams::IDLE,
         })
     }
 
@@ -184,6 +187,21 @@ impl WsConn {
             done += want;
         }
         Ok(Filled::Whole)
+    }
+
+    /// Start one binary frame of `total` bytes, beginning with `first`; the rest follows
+    /// through [`write_body`](Self::write_body). The frame header carries the whole
+    /// length, so the body can be written as it is produced.
+    pub(super) async fn begin_message(&mut self, total: u64, first: &[u8]) -> Result<(), DaemonError> {
+        let header = frame_header(0x82, total);
+        self.wire.write_all(header_bytes(&header)).await?;
+        self.wire.write_all(first).await
+    }
+
+    /// More of the frame [`begin_message`](Self::begin_message) started. Server frames
+    /// are unmasked, so the bytes go out as they are.
+    pub(super) async fn write_body(&mut self, bytes: &[u8]) -> Result<(), DaemonError> {
+        self.wire.write_all(bytes).await
     }
 
     /// Send one binary frame carrying `parts` end to end.

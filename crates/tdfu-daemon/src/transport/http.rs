@@ -97,18 +97,23 @@ fn preamble_for(decision: &Decision) -> String {
     )
 }
 
-/// One POST, its body already read, its reply streaming as chunks.
+/// One POST, its body read as the command asks for it, its reply streaming as chunks.
 #[derive(Debug)]
 pub struct HttpConn {
     wire: Wire,
-    body: Vec<u8>,
-    at: usize,
+    /// Body bytes still on the socket. The body is read on demand, so a firmware image
+    /// passes through a command a block at a time rather than being held whole.
+    body_left: u64,
+    /// When the whole body must have arrived by ([`body_budget`]), and that budget.
+    body_deadline: Option<(tokio::time::Instant, Duration)>,
     finished: bool,
     /// Which command is being served. See [`RawConn::current`](super::RawConn::current)
     /// for why this lives in the connection and not in a global.
     pub(super) current: Option<tdfu_proto::Command>,
     /// Did this request ask for the protocol narration (`X-Debug: 1`)?
     pub(super) narrate: bool,
+    /// The request payload or reply being streamed, if either is.
+    pub(super) streams: super::Streams,
 }
 
 impl HttpConn {
@@ -221,33 +226,20 @@ impl HttpConn {
         // Under a bound on the **whole** body, not only on each read of it: the C's
         // `dfu-remote` has neither, and a per-read deadline alone lets an announced
         // 64 MiB take a byte per deadline for ever.
-        let mut body = vec![0_u8; usize::try_from(length).unwrap_or(0)];
-        let per_read = Deadlines::uniform(wire.timeouts().read);
-        let budget = body_budget(wire.timeouts().read, length);
-        let reading = wire.read_all_of(&mut body, per_read, "request body");
-        match budget {
-            Some(budget) => match tokio::time::timeout(budget, reading).await {
-                Ok(result) => result?,
-                Err(_) => {
-                    return Err(DaemonError::TimedOut {
-                        doing: "request body",
-                        after: budget,
-                    });
-                }
-            },
-            None => reading.await?,
-        }
+        let body_deadline =
+            body_budget(wire.timeouts().read, length).map(|budget| (tokio::time::Instant::now() + budget, budget));
 
         wire.write_all(preamble_for(&decision).as_bytes()).await?;
         // One request per connection, so the ask for narration is a header on each POST.
         let narrate = header_value(&block, "x-debug").is_some_and(|value| value.trim() == "1");
         Ok(Self {
             wire,
-            body,
-            at: 0,
+            body_left: length,
+            body_deadline,
             finished: false,
             current: None,
             narrate,
+            streams: super::Streams::IDLE,
         })
     }
 
@@ -261,20 +253,34 @@ impl HttpConn {
         self.wire.timeouts()
     }
 
-    /// Take bytes from the buffered body. Never touches the socket, because the
-    /// body holds exactly one command, so running out is the end of the request.
-    pub(super) fn read_exact(&mut self, buf: &mut [u8], _deadlines: Deadlines) -> Filled {
-        let available = self.body.len().saturating_sub(self.at);
-        let take = available.min(buf.len());
-        if let (Some(target), Some(source)) = (buf.get_mut(..take), self.body.get(self.at..self.at + take)) {
-            target.copy_from_slice(source);
+    /// Take body bytes from the socket, never past the body's end: the body holds exactly
+    /// one command, so running out is the end of the request. The whole-body budget
+    /// still bounds the sum of the reads.
+    pub(super) async fn read_exact(&mut self, buf: &mut [u8], deadlines: Deadlines) -> Result<Filled, DaemonError> {
+        let take = usize::try_from(self.body_left).map_or(buf.len(), |left| left.min(buf.len()));
+        if let Some(slot) = buf.get_mut(..take)
+            && !slot.is_empty()
+        {
+            let reading = self.wire.read_all_of(slot, deadlines, "request body");
+            match self.body_deadline {
+                Some((deadline, budget)) => match tokio::time::timeout_at(deadline, reading).await {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        return Err(DaemonError::TimedOut {
+                            doing: "request body",
+                            after: budget,
+                        });
+                    }
+                },
+                None => reading.await?,
+            }
         }
-        self.at += take;
-        if take == buf.len() {
+        self.body_left -= take as u64;
+        Ok(if take == buf.len() {
             Filled::Whole
         } else {
             Filled::Eof(take)
-        }
+        })
     }
 
     /// Has this POST no more commands to serve?
@@ -285,7 +291,7 @@ impl HttpConn {
     /// has to stop here. Without it a body holding an unknown command *and* trailing bytes
     /// would be answered, terminated, and then read from again.
     pub(super) const fn spent(&self) -> bool {
-        self.finished || self.at >= self.body.len()
+        self.finished || self.body_left == 0
     }
 
     /// One chunk carrying `parts` end to end.
@@ -311,6 +317,27 @@ impl HttpConn {
                 self.wire.write_all(part).await?;
             }
         }
+        self.wire.write_all(b"\r\n").await
+    }
+
+    /// Start one chunk of `total` bytes beginning with `first`; the rest follows through
+    /// [`write_body`](Self::write_body) and the chunk ends with
+    /// [`end_message`](Self::end_message).
+    pub(super) async fn begin_message(&mut self, total: u64, first: &[u8]) -> Result<(), DaemonError> {
+        if self.finished {
+            return Err(DaemonError::AlreadyFinished);
+        }
+        self.wire.write_all(format!("{total:x}\r\n").as_bytes()).await?;
+        self.wire.write_all(first).await
+    }
+
+    /// More of the chunk [`begin_message`](Self::begin_message) started.
+    pub(super) async fn write_body(&mut self, bytes: &[u8]) -> Result<(), DaemonError> {
+        self.wire.write_all(bytes).await
+    }
+
+    /// The end of the chunk [`begin_message`](Self::begin_message) started.
+    pub(super) async fn end_message(&mut self) -> Result<(), DaemonError> {
         self.wire.write_all(b"\r\n").await
     }
 

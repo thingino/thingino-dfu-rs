@@ -22,6 +22,8 @@ pub struct RawConn {
     pub(super) current: Option<Command>,
     /// Has this connection asked for the protocol narration (`CMD_DEBUG`)?
     pub(super) narrate: bool,
+    /// The request payload or reply being streamed, if either is.
+    pub(super) streams: super::Streams,
 }
 
 impl RawConn {
@@ -31,6 +33,7 @@ impl RawConn {
             wire,
             current: None,
             narrate: false,
+            streams: super::Streams::IDLE,
         }
     }
 
@@ -52,6 +55,17 @@ impl RawConn {
         doing: &'static str,
     ) -> Result<Filled, DaemonError> {
         self.wire.read_exact(buf, deadlines, doing).await
+    }
+
+    /// Start a message of `total` bytes whose first bytes are `first`; the rest follows
+    /// through [`write_body`](Self::write_body). Raw TCP frames nothing around it.
+    pub(super) async fn begin_message(&mut self, _total: u64, first: &[u8]) -> Result<(), DaemonError> {
+        self.wire.write_all(first).await
+    }
+
+    /// More of the message [`begin_message`](Self::begin_message) started.
+    pub(super) async fn write_body(&mut self, bytes: &[u8]) -> Result<(), DaemonError> {
+        self.wire.write_all(bytes).await
     }
 
     /// Write `parts` end to end.

@@ -48,6 +48,40 @@ use wire::{Deadlines, Filled, Wire};
 /// How much is read at a time when skipping a payload we are not going to look at.
 const SKIP_CHUNK: usize = 16 * 1024;
 
+/// A request payload read, or a reply written, a piece at a time.
+///
+/// Both belong to the request in flight, like `current`, and so to the connection: a
+/// connection that drops mid-stream takes them with it.
+#[derive(Debug, Clone, Copy)]
+struct Streams {
+    /// The streamed request payload's announced length.
+    payload_len: u64,
+    /// How much of it is still on the socket.
+    payload_left: u64,
+    /// Bytes of an open reply still to write; `None` while no reply is open.
+    reply_left: Option<u64>,
+}
+
+impl Streams {
+    /// Nothing streaming.
+    const IDLE: Self = Self {
+        payload_len: 0,
+        payload_left: 0,
+        reply_left: None,
+    };
+}
+
+/// A request as [`Conn::next_incoming`] hands it over.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Incoming {
+    /// The payload, read whole.
+    Whole(Command, Vec<u8>),
+    /// A payload of this many bytes, still on the socket, for [`Conn::payload`] to read
+    /// as the command gets to it. Whatever the command leaves unread is read and dropped
+    /// before its final frame.
+    Streamed(Command, u64),
+}
+
 /// An accepted client, whatever it speaks.
 ///
 /// An enum rather than a `dyn` trait so the async methods stay inherent and `?Send`
@@ -132,7 +166,44 @@ impl Conn {
     /// if it stopped part-way through a frame it had announced;
     /// [`DaemonError::TimedOut`]; or an I/O failure.
     pub async fn next_request(&mut self) -> Result<Option<(Command, Vec<u8>)>, DaemonError> {
+        let Some(request) = self.next_header().await? else {
+            return Ok(None);
+        };
+        let payload = self.whole_payload(request).await?;
+        Ok(Some((request.command, payload)))
+    }
+
+    /// [`next_request`](Self::next_request), except that a payload over `stream_above`
+    /// bytes is left on the socket and handed over as [`Incoming::Streamed`]: a daemon
+    /// with a few hundred kilobytes of RAM cannot hold a 16 MiB image, and has no need
+    /// to. `None` reads every payload whole.
+    ///
+    /// # Errors
+    /// As [`next_request`](Self::next_request).
+    pub async fn next_incoming(&mut self, stream_above: Option<u32>) -> Result<Option<Incoming>, DaemonError> {
+        let Some(request) = self.next_header().await? else {
+            return Ok(None);
+        };
+        if stream_above.is_some_and(|limit| request.payload_len > limit) {
+            let len = u64::from(request.payload_len);
+            *self.streams_mut() = Streams {
+                payload_len: len,
+                payload_left: len,
+                reply_left: None,
+            };
+            return Ok(Some(Incoming::Streamed(request.command, len)));
+        }
+        let payload = self.whole_payload(request).await?;
+        Ok(Some(Incoming::Whole(request.command, payload)))
+    }
+
+    /// The next request's header, with the command put in flight. Unknown commands are
+    /// answered and skipped here, and a previous request's unread payload is skipped
+    /// first, so the header really is the next one.
+    async fn next_header(&mut self) -> Result<Option<RequestHeader>, DaemonError> {
         self.set_current(None);
+        self.drain_payload().await?;
+        *self.streams_mut() = Streams::IDLE;
         loop {
             if let Self::Http(http) = self {
                 // Exactly one command per POST.
@@ -158,21 +229,8 @@ impl Conn {
 
             match RequestHeader::decode(&header) {
                 Ok(request) => {
-                    let mut payload = vec![0_u8; request.payload_len as usize];
-                    let want = payload.len();
-                    let deadlines = Deadlines::uniform(self.timeouts().read);
-                    match self.read_exact(&mut payload, deadlines, "payload").await? {
-                        Filled::Whole => {}
-                        Filled::Eof(got) => {
-                            return Err(DaemonError::Truncated {
-                                doing: "payload",
-                                got,
-                                want,
-                            });
-                        }
-                    }
                     self.set_current(Some(request.command));
-                    return Ok(Some((request.command, payload)));
+                    return Ok(Some(request));
                 }
                 Err(ProtoError::UnknownCommand) => {
                     // Refuse and keep reading. The skip is what makes that
@@ -188,6 +246,155 @@ impl Conn {
                 }
             }
         }
+    }
+
+    /// The whole of `request`'s payload.
+    async fn whole_payload(&mut self, request: RequestHeader) -> Result<Vec<u8>, DaemonError> {
+        let mut payload = vec![0_u8; request.payload_len as usize];
+        let want = payload.len();
+        let deadlines = Deadlines::uniform(self.timeouts().read);
+        match self.read_exact(&mut payload, deadlines, "payload").await? {
+            Filled::Whole => Ok(payload),
+            Filled::Eof(got) => Err(DaemonError::Truncated {
+                doing: "payload",
+                got,
+                want,
+            }),
+        }
+    }
+
+    /// The next `buf.len()` bytes of a streamed request's payload
+    /// ([`Incoming::Streamed`]).
+    ///
+    /// # Errors
+    /// [`DaemonError::Stream`] for more than is left of it, which is this side's
+    /// mistake; [`DaemonError::Truncated`] if the peer stopped sending; a timeout or an
+    /// I/O failure.
+    pub async fn payload(&mut self, buf: &mut [u8]) -> Result<(), DaemonError> {
+        let streams = *self.streams();
+        let want = u64::try_from(buf.len()).unwrap_or(u64::MAX);
+        if want > streams.payload_left {
+            return Err(DaemonError::Stream("read past the end of the request payload"));
+        }
+        let deadlines = Deadlines::uniform(self.timeouts().read);
+        if let Filled::Eof(got) = self.read_exact(buf, deadlines, "payload").await? {
+            let before = streams.payload_len - streams.payload_left;
+            return Err(DaemonError::Truncated {
+                doing: "payload",
+                got: usize::try_from(before).unwrap_or(usize::MAX).saturating_add(got),
+                want: usize::try_from(streams.payload_len).unwrap_or(usize::MAX),
+            });
+        }
+        self.streams_mut().payload_left = streams.payload_left - want;
+        Ok(())
+    }
+
+    /// Bytes of a streamed request's payload not yet read.
+    #[must_use]
+    pub const fn payload_left(&self) -> u64 {
+        self.streams().payload_left
+    }
+
+    /// Read and drop whatever is left of a streamed request's payload.
+    ///
+    /// Every final frame does this first ([`respond`](Self::respond),
+    /// [`begin_reply`](Self::begin_reply)): a peer may read nothing until it has sent
+    /// the whole request, and on raw TCP and WebSocket the next request starts after it.
+    ///
+    /// # Errors
+    /// As [`payload`](Self::payload).
+    pub async fn drain_payload(&mut self) -> Result<(), DaemonError> {
+        let left = self.streams().payload_left;
+        if left > 0 {
+            self.discard(left).await?;
+            self.streams_mut().payload_left = 0;
+        }
+        Ok(())
+    }
+
+    /// Open the final OK/ERROR frame for the request in flight with a payload of `len`
+    /// bytes, which follow through [`reply_body`](Self::reply_body) as they are
+    /// produced; [`end_reply`](Self::end_reply) closes it. No other frame may go out
+    /// while it is open.
+    ///
+    /// This is how a `READ` answers without holding the image: a NAND alt 0 is
+    /// 256 MiB, and a daemon on a microcontroller holds none of it.
+    ///
+    /// # Errors
+    /// [`DaemonError::OversizeResponse`] as for [`respond`](Self::respond);
+    /// [`DaemonError::Stream`] if a reply is already open; or an I/O failure.
+    pub async fn begin_reply(&mut self, status: Status, len: u64) -> Result<(), DaemonError> {
+        let oversize = DaemonError::OversizeResponse {
+            len: usize::try_from(len).unwrap_or(usize::MAX),
+            command: self.current(),
+        };
+        let Ok(wire_len) = u32::try_from(len) else {
+            return Err(oversize);
+        };
+        if exceeds_payload_cap(wire_len) && self.current() != Some(Command::Read) {
+            return Err(oversize);
+        }
+        if self.streams().reply_left.is_some() {
+            return Err(DaemonError::Stream("a reply is already open"));
+        }
+        self.drain_payload().await?;
+        let header = ResponseHeader {
+            status,
+            payload_len: wire_len,
+        }
+        .encode();
+        let total = u64::from(wire_len).saturating_add(header.len() as u64);
+        match self {
+            Self::Raw(raw) => raw.begin_message(total, &header).await?,
+            Self::Ws(ws) => ws.begin_message(total, &header).await?,
+            Self::Http(http) => http.begin_message(total, &header).await?,
+        }
+        self.streams_mut().reply_left = Some(len);
+        Ok(())
+    }
+
+    /// More of the reply [`begin_reply`](Self::begin_reply) opened.
+    ///
+    /// # Errors
+    /// [`DaemonError::Stream`] with no reply open, or past its announced length; or an
+    /// I/O failure.
+    pub async fn reply_body(&mut self, bytes: &[u8]) -> Result<(), DaemonError> {
+        let Some(left) = self.streams().reply_left else {
+            return Err(DaemonError::Stream("reply bytes with no reply open"));
+        };
+        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if len > left {
+            return Err(DaemonError::Stream("reply bytes past the announced length"));
+        }
+        match self {
+            Self::Raw(raw) => raw.write_body(bytes).await?,
+            Self::Ws(ws) => ws.write_body(bytes).await?,
+            Self::Http(http) => http.write_body(bytes).await?,
+        }
+        self.streams_mut().reply_left = Some(left - len);
+        Ok(())
+    }
+
+    /// Close the reply [`begin_reply`](Self::begin_reply) opened. As with
+    /// [`respond`](Self::respond), the request is then answered, and on HTTP the body
+    /// ends.
+    ///
+    /// # Errors
+    /// [`DaemonError::Stream`] with no reply open, or one short of its announced length;
+    /// or an I/O failure.
+    pub async fn end_reply(&mut self) -> Result<(), DaemonError> {
+        match self.streams().reply_left {
+            Some(0) => {}
+            Some(_) => return Err(DaemonError::Stream("the reply ended short of its announced length")),
+            None => return Err(DaemonError::Stream("no reply is open")),
+        }
+        self.streams_mut().reply_left = None;
+        self.set_current(None);
+        if let Self::Http(http) = self {
+            http.end_message().await?;
+            http.finish().await?;
+        }
+        Ok(())
     }
 
     /// The final OK/ERROR frame for the request just handled.
@@ -211,6 +418,7 @@ impl Conn {
                 command: self.current(),
             });
         }
+        self.drain_payload().await?;
         let header = ResponseHeader {
             status,
             payload_len: len,
@@ -424,6 +632,22 @@ impl Conn {
         }
     }
 
+    const fn streams(&self) -> &Streams {
+        match self {
+            Self::Raw(raw) => &raw.streams,
+            Self::Ws(ws) => &ws.streams,
+            Self::Http(http) => &http.streams,
+        }
+    }
+
+    const fn streams_mut(&mut self) -> &mut Streams {
+        match self {
+            Self::Raw(raw) => &mut raw.streams,
+            Self::Ws(ws) => &mut ws.streams,
+            Self::Http(http) => &mut http.streams,
+        }
+    }
+
     /// The token handshake: `[4:magic][1:version][1:token_len][token]`.
     async fn token_handshake(&mut self, auth: &Auth) -> Result<(), DaemonError> {
         let transport = self.transport();
@@ -546,11 +770,14 @@ impl Conn {
         match self {
             Self::Raw(raw) => raw.read_exact(buf, deadlines, doing).await,
             Self::Ws(ws) => ws.read_exact(buf, deadlines, doing).await,
-            Self::Http(http) => Ok(http.read_exact(buf, deadlines)),
+            Self::Http(http) => http.read_exact(buf, deadlines).await,
         }
     }
 
     async fn send_message(&mut self, parts: &[&[u8]]) -> Result<(), DaemonError> {
+        if self.streams().reply_left.is_some() {
+            return Err(DaemonError::Stream("a frame inside an open reply"));
+        }
         match self {
             Self::Raw(raw) => raw.send_message(parts).await,
             Self::Ws(ws) => ws.send_message(parts).await,
