@@ -171,8 +171,12 @@ fn options() -> OpenOptions {
 
 /// A name no other staging file will take: process, counter, nanosecond.
 fn unique() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    use std::sync::atomic::Ordering;
+    // Xtensa (the ESP32 backpack) has no 64-bit atomics; the name only needs to differ.
+    #[cfg(target_has_atomic = "64")]
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    #[cfg(not(target_has_atomic = "64"))]
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let count = COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

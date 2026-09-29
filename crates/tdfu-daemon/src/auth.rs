@@ -21,7 +21,29 @@
 //!   from an address is now answered later than the last, up to [`MAX_PAUSE`].
 
 use core::net::{IpAddr, SocketAddr};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
+
+/// A connection counter: 64-bit where the target has 64-bit atomics. Xtensa (the ESP32
+/// backpack) has none, and a u32 there wraps only after four billion connections.
+#[derive(Debug, Default)]
+struct Counter(
+    #[cfg(target_has_atomic = "64")] core::sync::atomic::AtomicU64,
+    #[cfg(not(target_has_atomic = "64"))] core::sync::atomic::AtomicU32,
+);
+
+impl Counter {
+    fn bump(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn get(&self) -> u64 {
+        #[cfg(target_has_atomic = "64")]
+        let count = self.0.load(Ordering::Relaxed);
+        #[cfg(not(target_has_atomic = "64"))]
+        let count = u64::from(self.0.load(Ordering::Relaxed));
+        count
+    }
+}
 use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -181,9 +203,9 @@ impl AuthEvent {
 #[derive(Debug, Default)]
 pub struct Auth {
     token: Option<Vec<u8>>,
-    accepted: AtomicU64,
-    rejected: AtomicU64,
-    abandoned: AtomicU64,
+    accepted: Counter,
+    rejected: Counter,
+    abandoned: Counter,
     /// Consecutive refusals per source address, which is what
     /// [`Auth::pause_after_rejection`] charges for. Cleared for an address that
     /// authenticates, so a legitimate client that mistyped once starts again from zero.
@@ -232,19 +254,19 @@ impl Auth {
     /// turns the one number an incident is read from into noise.
     #[must_use]
     pub fn rejections(&self) -> u64 {
-        self.rejected.load(Ordering::Relaxed)
+        self.rejected.get()
     }
 
     /// How many have been accepted.
     #[must_use]
     pub fn acceptances(&self) -> u64 {
-        self.accepted.load(Ordering::Relaxed)
+        self.accepted.get()
     }
 
     /// How many peers went away part-way through a handshake.
     #[must_use]
     pub fn abandons(&self) -> u64 {
-        self.abandoned.load(Ordering::Relaxed)
+        self.abandoned.get()
     }
 
     /// Check a presented token, log the outcome, and say what to do.
@@ -348,15 +370,15 @@ impl Auth {
         self.score(peer, kind);
         match kind {
             AuthEventKind::Rejected(_) => {
-                self.rejected.fetch_add(1, Ordering::Relaxed);
+                self.rejected.bump();
                 tracing::warn!("{}", event.log_line());
             }
             AuthEventKind::Accepted => {
-                self.accepted.fetch_add(1, Ordering::Relaxed);
+                self.accepted.bump();
                 tracing::debug!("{}", event.log_line());
             }
             AuthEventKind::Abandoned => {
-                self.abandoned.fetch_add(1, Ordering::Relaxed);
+                self.abandoned.bump();
                 tracing::debug!("{}", event.log_line());
             }
         }

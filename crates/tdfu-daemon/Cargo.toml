@@ -47,7 +47,7 @@ thiserror.workspace = true
 #
 # Deliberately OFF: `rt-multi-thread` (D1 says single-threaded), `fs`, `process`,
 # `sync`, `bytes`.
-tokio = { version = "1", default-features = false, features = ["net", "io-util", "time", "rt", "signal", "macros"] }
+tokio = { version = "1", default-features = false, features = ["net", "io-util", "time", "rt", "macros"] }
 # `IPV6_V6ONLY` cleared on the listening socket, as `dfu-remote/main.c:1069-1100` does,
 # so one socket serves both families; tokio has no setter for it. Already in the graph
 # through tokio, at this version.
@@ -61,6 +61,11 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 # The same subscriber `tdfu-cli` installs, with the same levels, so `-d` reads the same
 # on both binaries.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+
+# Unix signals are the binary's shutdown path; ESP-IDF has none, and the backpack
+# firmware runs the library only.
+[target.'cfg(not(target_os = "espidf"))'.dependencies]
+tokio = { version = "1", default-features = false, features = ["signal"] }
 
 [dev-dependencies]
 # `FakeGadget` and `MockTransport`: the whole command surface is tested against the
