@@ -47,6 +47,19 @@ pub mod mock;
 #[cfg(not(any(target_family = "wasm", target_os = "espidf")))]
 pub mod native;
 
+// The ESP-IDF USB Host Library backend, for the ESP32-S3 dev backpack. Target-gated like
+// `native`, so no other build can acquire `esp-idf-sys`.
+#[cfg(target_os = "espidf")]
+#[allow(
+    unsafe_code,
+    reason = "the FFI edge of the ESP-IDF USB Host Library; every block has a SAFETY comment"
+)]
+pub mod espidf;
+
+// Raw configuration descriptors, for a backend handed bytes instead of a parsed tree.
+#[cfg(any(test, target_os = "espidf"))]
+mod descriptors;
+
 pub use error::{Pipe, UsbError, UsbErrorKind};
 pub use transport::{LocalUsbBackend, LocalUsbTransport};
 pub use types::{
