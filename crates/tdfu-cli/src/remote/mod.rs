@@ -43,8 +43,8 @@ mod tests;
 use std::io::Write;
 
 use tdfu_core::clock::Sleeper;
-use tdfu_core::model::AltSel;
-use tdfu_proto::{DeviceEntry, ERASE_ALT, ERASE_TOKEN, Request, WireVariant, crc32};
+use tdfu_core::model::{AltSel, Variant};
+use tdfu_proto::{DaemonInfo, DeviceEntry, ERASE_ALT, ERASE_TOKEN, Loaders, Request, WireVariant, crc32};
 
 use crate::exit::OpClass;
 use crate::images::Loaded;
@@ -88,6 +88,8 @@ mod doing {
     pub const REBOOT: &str = "the reboot";
     /// `CMD_DEBUG`: `-d`'s ask for the daemon's narration.
     pub const NARRATION: &str = "the narration request";
+    /// `CMD_INFO`: whether the daemon has loaders of its own.
+    pub const INFO: &str = "the info request";
 }
 
 /// How many times [`Session::settle`] re-asks the daemon what the target is.
@@ -129,6 +131,7 @@ pub async fn run<C: Sleeper>(
         devices: None,
         chosen: Chosen::Operator,
         bar: Bar::new(),
+        daemon_loaders: None,
     };
     // One line, on stderr, saying which machine did this. A pasted terminal that does not
     // say where a flash happened costs a round trip, and the local run's banner makes the
@@ -172,6 +175,8 @@ struct Session<'a> {
     chosen: Chosen,
     /// Where an operation's account of itself goes.
     bar: Bar,
+    /// Whether the daemon has a loader tree of its own, once asked ([`Session::daemon_loaders`]).
+    daemon_loaders: Option<Loaders>,
 }
 
 /// A row of the daemon's listing, and the identity that listing gave it.
@@ -410,31 +415,7 @@ impl Session<'_> {
             }
         }
 
-        // **Cloned, where `write` takes.** A loader pair is two files of a few hundred
-        // kilobytes and this is the only place they are needed, so the copy is not worth
-        // restructuring `Loaded` around; `write` deliberately `take`s its image instead,
-        // because that one is up to 64 MiB. The asymmetry is on purpose and is stated
-        // here so it does not read as an oversight beside `write`'s explicit note.
-        let blobs = self.loaded.loaders.as_ref().map(|blobs| tdfu_proto::Blobs {
-            spl: blobs.stage1.clone(),
-            uboot: blobs.uboot.clone(),
-        });
-        let variant = if let Some(loaders) = self.loaded.loaders.as_ref() {
-            // A streamed pair skips detection *and* the daemon's firmware
-            // tree, so there is no variant to name (`cli/main.c:357-359`).
-            //
-            // Matched rather than `map_or_else`'d: the branch is already inside "there are
-            // loaders", so an empty-string fallback was an arm nothing could reach.
-            let source = loaders.source.clone();
-            self.say(
-                &format!("Streaming {source} to the daemon in place of its firmware tree."),
-                err,
-            );
-            Vec::new()
-        } else {
-            self.variant_for(index, entry.variant, err)?
-        };
-
+        let (variant, blobs) = self.loaders_for(index, entry.variant, err)?;
         self.send_and_finish(&Request::Bootstrap { index, variant, blobs }, doing::BOOTSTRAP, err)?;
         // The stage this device reports has just changed, so the cached answer is stale.
         self.devices = None;
@@ -476,7 +457,7 @@ impl Session<'_> {
     /// gadget (`dfu-remote/main.c:344-353`) and hands back whatever the device
     /// settled into: a gadget, which the caller then has nothing to bootstrap; a bootrom
     /// with a name, which it bootstraps as always; or the state it was already in, whose
-    /// refusal is by then a true one, from [`variant_for`](Session::variant_for) for a
+    /// refusal is by then a true one, from [`variant_of`](Session::variant_of) for a
     /// bootrom still reporting `0xFF` and from [`entry`](Session::entry) for a row that
     /// never came back. That window is **one budget for the whole settle**, not one per
     /// phase: a device may pass through 1 and 2 and still be counted out at 30 s.
@@ -565,7 +546,7 @@ impl Session<'_> {
             }
         }
         // The window has closed, so the last answer is the true one and gets to make its
-        // own refusal: `variant_for`'s for a bootrom still reporting `0xFF`, `entry`'s own
+        // own refusal: `variant_of`'s for a bootrom still reporting `0xFF`, `entry`'s own
         // for a row that never came back. The list the last poll cached is that answer, so
         // reading it costs no further round trip.
         let last = self.entry(index, err)?;
@@ -594,7 +575,8 @@ impl Session<'_> {
             && self.loaded.loaders.is_none()
     }
 
-    /// Which loader the daemon should use, as a name it will accept.
+    /// The SoC a bootstrap of device `index` loads for: `--cpu`, else what the daemon
+    /// detected.
     ///
     /// An empty variant field means "detect it yourself", and this client never
     /// sends it for a bootrom the daemon has already failed to identify: the daemon's
@@ -602,25 +584,126 @@ impl Session<'_> {
     /// resolve, and asking again produces the same answer wrapped in one of the daemon's
     /// thirteen terse strings. The local run refuses the same case with the same advice
     /// (`run::refuse_detection`).
-    fn variant_for(&mut self, index: u8, reported: WireVariant, err: &mut dyn Write) -> Result<Vec<u8>, RemoteError> {
+    fn variant_of(&mut self, index: u8, reported: WireVariant, err: &mut dyn Write) -> Result<Variant, RemoteError> {
         if let Some(forced) = self.plan.target.cpu {
             // Every `Variant::loader_dir` is a name in the frozen wire table
             // (`every_cpu_value_has_a_wire_name` pins it), so `--cpu` needs no
             // translation and cannot become a name the daemon will not recognise.
-            return Ok(forced.loader_dir().as_bytes().to_vec());
+            return Ok(forced);
         }
-        let Some(name) = reported.name() else {
-            return Err(RemoteError::refusal(format!(
+        let unknown = || {
+            RemoteError::refusal(format!(
                 "the daemon at {} does not know what SoC device {index} is, so this client cannot choose a loader: \
                  pass --cpu with the part's loader name, or stream your own with --spl and --uboot",
                 self.at
-            )));
+            ))
+        };
+        let Some(name) = reported.name() else {
+            return Err(unknown());
+        };
+        let Some(variant) = Variant::from_cpu_arg(name) else {
+            return Err(unknown());
         };
         // **The auto-detect line**, and only here: the C prints it under
         // `need_variant = options.bootstrap && !dfu_custom_blobs` (`cli/main.c:360-364`),
         // which is exactly this branch — a bare transfer detects silently.
         self.say(&format!("Auto-detected remote device: {name}"), err);
-        Ok(name.as_bytes().to_vec())
+        Ok(variant)
+    }
+
+    /// What a `CMD_BOOTSTRAP` of device `index` carries: the variant for a daemon to
+    /// load out of its own tree, or a loader pair for it to run as it is.
+    ///
+    /// A `--spl` + `--uboot` pair is always sent. Otherwise the variant is settled first,
+    /// so nothing but `DISCOVER` goes out for a target nobody can name, and then the
+    /// daemon is asked whether it has a tree ([`daemon_loaders`](Session::daemon_loaders)):
+    /// one without, a daemon on a microcontroller, is sent the variant's pair from this
+    /// machine's tree, and one with is sent the variant. `--firmware-dir` is only for the
+    /// first kind, and with the second it is refused rather than ignored, because being
+    /// ignored is how a daemon's own loaders get uploaded while the operator believes they
+    /// chose others.
+    fn loaders_for(
+        &mut self,
+        index: u8,
+        reported: WireVariant,
+        err: &mut dyn Write,
+    ) -> Result<(Vec<u8>, Option<tdfu_proto::Blobs>), RemoteError> {
+        // **Cloned, where `write` takes.** A loader pair is two files of a few hundred
+        // kilobytes and this is the only place they are needed, so the copy is not worth
+        // restructuring `Loaded` around; `write` deliberately `take`s its image instead,
+        // because that one is up to 64 MiB. The asymmetry is on purpose and is stated
+        // here so it does not read as an oversight beside `write`'s explicit note.
+        if let Some(loaders) = self.loaded.loaders.as_ref() {
+            let blobs = tdfu_proto::Blobs {
+                spl: loaders.stage1.clone(),
+                uboot: loaders.uboot.clone(),
+            };
+            // A streamed pair skips detection *and* the daemon's firmware
+            // tree, so there is no variant to name (`cli/main.c:357-359`).
+            let source = loaders.source.clone();
+            self.say(
+                &format!("Streaming {source} to the daemon in place of its firmware tree."),
+                err,
+            );
+            return Ok((Vec::new(), Some(blobs)));
+        }
+        let variant = self.variant_of(index, reported, err)?;
+        // `Loaders` is `#[non_exhaustive]`: a kind added later is a tree until this client
+        // knows better, which is what every daemon before the question was.
+        if self.daemon_loaders(err)? != Loaders::Absent {
+            if self.plan.images.firmware_dir.is_some() {
+                return Err(RemoteError::refusal(format!(
+                    "--firmware-dir points at a loader tree on this machine, and the daemon at {} bootstraps \
+                     from its own. Drop it, or stream the pair you want with --spl and --uboot",
+                    self.at
+                )));
+            }
+            return Ok((variant.loader_dir().as_bytes().to_vec(), None));
+        }
+        let root = crate::loaders::firmware_root(self.plan.images.firmware_dir.as_deref());
+        let pair = crate::images::loaders(&root, variant).map_err(|error| {
+            RemoteError::File(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "the daemon at {} has no loaders of its own, so this machine sends them, and they are \
+                     missing: {error}. Run `cargo xtask fetch-loaders`, pass --firmware-dir, or stream a \
+                     pair with --spl and --uboot",
+                    self.at
+                ),
+            ))
+        })?;
+        self.say(
+            &format!(
+                "The daemon at {} has no loaders of its own; sending {}.",
+                self.at, pair.source
+            ),
+            err,
+        );
+        Ok((
+            Vec::new(),
+            Some(tdfu_proto::Blobs {
+                spl: pair.stage1,
+                uboot: pair.uboot,
+            }),
+        ))
+    }
+
+    /// Whether the daemon has a loader tree of its own (`CMD_INFO`), asked once per
+    /// connection. A daemon that predates the question refuses it as an unknown command
+    /// and keeps the connection, and it has a tree: every daemon before it did.
+    fn daemon_loaders(&mut self, err: &mut dyn Write) -> Result<Loaders, RemoteError> {
+        if let Some(known) = self.daemon_loaders {
+            return Ok(known);
+        }
+        self.send(&Request::Info, doing::INFO)?;
+        let loaders = match self.finish(doing::INFO, err) {
+            Ok(payload) => DaemonInfo::decode(&payload).loaders.unwrap_or(Loaders::Tree),
+            Err(RemoteError::Refused(message)) if message.ends_with(": unknown command") => Loaders::Tree,
+            Err(other) => return Err(other),
+        };
+        tracing::debug!(?loaders, "the daemon's loaders");
+        self.daemon_loaders = Some(loaders);
+        Ok(loaders)
     }
 
     /// `--erase`: the wipe token, written to the loader's `erase` alt.

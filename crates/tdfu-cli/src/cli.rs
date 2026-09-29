@@ -345,16 +345,11 @@ impl Cli {
             }
             return Ok(None);
         };
-        // `--firmware-dir` is a path on *this* machine and the bootstrap happens on the
-        // daemon's. The C takes it and discards it (`cli/remote.c:533`), so the loaders
-        // that get uploaded are whichever tree the daemon was started with — a wrong
-        // loader chosen silently, which is the one class of mistake `--cpu`'s whole
-        // careful surface exists to avoid.
-        if self.firmware_dir.is_some() {
-            return Err(PlanError::RemoteOptionIsLocal {
-                option: "--firmware-dir",
-            });
-        }
+        // `--firmware-dir` with `--host` is the tree a daemon with no loaders of its own is
+        // sent the pair from. The C took it and discarded it (`cli/remote.c:533`), so a
+        // daemon's own loaders were uploaded while the operator believed they had chosen
+        // others; a daemon that has a tree refuses it at the bootstrap instead, which is
+        // the first moment this client can know which kind it is talking to.
         Ok(Some(Remote {
             host,
             // The default is resolved here rather than by clap, so that "given" is still
@@ -877,27 +872,18 @@ mod tests {
         Ok(())
     }
 
-    /// `--firmware-dir` names a tree on **this** machine, so it cannot mean anything with
-    /// `--host` — and being ignored is how a daemon's own loaders get uploaded while the
-    /// operator believes they chose the ones in that directory.
+    /// `--firmware-dir` with `--host` is the tree a daemon with no loaders of its own is
+    /// sent the pair from, so the plan takes it; a daemon that has a tree refuses it at
+    /// the bootstrap, the first moment the client knows which kind it is talking to
+    /// (`remote::tests::a_daemon_with_a_tree_refuses_a_local_firmware_dir`).
     #[test]
-    fn a_local_only_option_is_refused_with_a_host() -> TestResult {
-        assert_eq!(
-            parse(&["-b", "--host", "cam", "--firmware-dir", "/opt/fw"])?.into_plan(),
-            Err(PlanError::RemoteOptionIsLocal {
-                option: "--firmware-dir"
-            })
-        );
-        // Without `--host` it is exactly as useful as it was.
-        assert!(parse(&["-b", "--firmware-dir", "/opt/fw"])?.into_plan().is_ok());
+    fn a_firmware_dir_is_taken_with_a_host() -> TestResult {
         assert!(
-            PlanError::RemoteOptionIsLocal {
-                option: "--firmware-dir"
-            }
-            .to_string()
-            .contains("stream the pair you want with --spl and --uboot"),
-            "the refusal has to say what to do instead"
+            parse(&["-b", "--host", "cam", "--firmware-dir", "/opt/fw"])?
+                .into_plan()
+                .is_ok()
         );
+        assert!(parse(&["-b", "--firmware-dir", "/opt/fw"])?.into_plan().is_ok());
         Ok(())
     }
 

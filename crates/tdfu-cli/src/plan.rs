@@ -307,22 +307,6 @@ pub enum PlanError {
         option: &'static str,
     },
 
-    /// A flag that names something on *this* machine, given with `--host`.
-    ///
-    /// The C accepts `--firmware-dir` with `--host` and throws it away — `remote_bootstrap`
-    /// opens with `(void)firmware_dir;` (`cli/remote.c:533`) — so the daemon quietly
-    /// USB-boots out of *its* loader tree while the operator believes they chose one.
-    /// That is a wrong-loader hazard dressed as a convenience, and it is the worst shape
-    /// a defect can take: a flag accepted and ignored leaves nothing to grep for.
-    #[error(
-        "{option} points at a loader tree on this machine, and --host runs the bootstrap on the daemon's, \
-         out of the tree that daemon was started with. Drop it, or stream the pair you want with --spl and --uboot"
-    )]
-    RemoteOptionIsLocal {
-        /// Which one was given.
-        option: &'static str,
-    },
-
     /// `--cpu`, `--spl`, `--uboot` or `--firmware-dir` with nothing to bootstrap.
     #[error(
         "{option} chooses the loaders a bootstrap uploads; nothing in this command bootstraps. \

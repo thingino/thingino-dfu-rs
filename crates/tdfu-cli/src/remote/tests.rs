@@ -148,6 +148,11 @@ fn ok() -> Vec<u8> {
     b"OK".to_vec()
 }
 
+/// `CMD_INFO`'s answer from a daemon with a loader tree of its own, as on a Linux host.
+fn info_with(loaders: tdfu_proto::Loaders) -> Vec<Step> {
+    vec![Step::Ok(tdfu_proto::DaemonInfo::new("test", loaders).encode())]
+}
+
 /// A daemon script that answers `DISCOVER` with the same row `count` times over.
 ///
 /// [`Session::settle`](super::Session) re-asks for as long as a bootrom keeps reporting
@@ -182,11 +187,12 @@ fn rpc_cli_remote_flow_runs_the_whole_plan_in_order() -> TestResult {
         vec![
             // The bootstrap's DISCOVER: a bootrom, so it is USB-booted first.
             vec![Step::Ok(discovered(0, WireVariant(6)))],
-            vec![Step::Ok(ok())],                         // BOOTSTRAP
-            vec![Step::Ok(ok())],                         // WRITE, the wipe token
-            vec![Step::Ok(ok())],                         // WRITE, the image
+            info_with(tdfu_proto::Loaders::Tree), // INFO: its own loader tree
+            vec![Step::Ok(ok())],                 // BOOTSTRAP
+            vec![Step::Ok(ok())],                 // WRITE, the wipe token
+            vec![Step::Ok(ok())],                 // WRITE, the image
             vec![Step::Ok(vec![0x00, 0x00, 0x00, 0x00])], // READ: no data, CRC of nothing
-            vec![Step::Ok(Vec::new())],                   // REBOOT: empty OK
+            vec![Step::Ok(Vec::new())],           // REBOOT: empty OK
         ],
     )?;
 
@@ -215,13 +221,14 @@ fn rpc_cli_remote_flow_runs_the_whole_plan_in_order() -> TestResult {
         commands,
         vec![
             Command::Discover.wire_byte(),
+            Command::Info.wire_byte(),
             Command::Bootstrap.wire_byte(),
             Command::Write.wire_byte(), // --erase
             Command::Write.wire_byte(), // -w, with --verify's trailing byte
             Command::Read.wire_byte(),
             Command::Reboot.wire_byte(),
         ],
-        "bootstrap → erase → write(+verify) → read → reboot"
+        "info → bootstrap → erase → write(+verify) → read → reboot"
     );
     assert!(transcript.token.is_none(), "no --token, so no handshake");
     Ok(())
@@ -484,6 +491,7 @@ fn fe_cli_autobootstrap_over_the_wire() -> TestResult {
         false,
         vec![
             vec![Step::Ok(discovered(0, WireVariant(50)))], // t32lq in the bootrom
+            info_with(tdfu_proto::Loaders::Tree),
             vec![Step::Ok(ok())],
             vec![Step::Ok(ok())],
         ],
@@ -498,7 +506,7 @@ fn fe_cli_autobootstrap_over_the_wire() -> TestResult {
         "{}",
         outcome.err
     );
-    let (_, payload) = transcript.requests.get(1).ok_or("no bootstrap")?;
+    let (_, payload) = transcript.requests.get(2).ok_or("no bootstrap")?;
     assert_eq!(payload, &b"\x00\x05t32lq".to_vec(), "index, then the variant name");
     // **The mid-boot wait, third pin.** A bootrom the daemon *can* name is live, so nothing waits:
     // the bootstrap goes out on the answer the first `DISCOVER` already gave.
@@ -626,7 +634,8 @@ fn a_bootrom_that_names_itself_late_is_bootstrapped_with_that_name() -> TestResu
         vec![
             vec![Step::Ok(discovered(0, WireVariant::UNKNOWN))],
             vec![Step::Ok(discovered(0, WireVariant(50)))], // t32lq, on the second ask
-            vec![Step::Ok(ok())],                           // BOOTSTRAP
+            info_with(tdfu_proto::Loaders::Tree),
+            vec![Step::Ok(ok())], // BOOTSTRAP
         ],
     )?;
     let plan = plan_for(daemon.port(), &["-b"])?;
@@ -640,7 +649,7 @@ fn a_bootrom_that_names_itself_late_is_bootstrapped_with_that_name() -> TestResu
         "{}",
         outcome.err
     );
-    let (command, payload) = transcript.requests.get(2).ok_or("no bootstrap")?;
+    let (command, payload) = transcript.requests.get(3).ok_or("no bootstrap")?;
     assert_eq!(*command, Command::Bootstrap.wire_byte());
     assert_eq!(payload, &b"\x00\x05t32lq".to_vec(), "the settled name, not the 0xFF");
     Ok(())
@@ -1588,6 +1597,7 @@ fn a_daemon_refusal_takes_the_operations_own_exit_code() -> TestResult {
         false,
         vec![
             vec![Step::Ok(discovered(0, WireVariant(6)))],
+            info_with(tdfu_proto::Loaders::Tree),
             vec![Step::Fail("bootstrap failed: Device not found".to_owned())],
         ],
     )?;
@@ -1972,6 +1982,7 @@ fn cpu_skips_the_auto_detect_line() -> TestResult {
         false,
         vec![
             vec![Step::Ok(discovered(0, WireVariant::UNKNOWN))],
+            info_with(tdfu_proto::Loaders::Tree),
             vec![Step::Ok(ok())],
         ],
     )?;
@@ -1981,7 +1992,7 @@ fn cpu_skips_the_auto_detect_line() -> TestResult {
 
     assert!(outcome.result.is_ok(), "{:?}", outcome.refusal());
     assert!(!outcome.err.contains("Auto-detected"), "{}", outcome.err);
-    let (_, payload) = transcript.requests.get(1).ok_or("no bootstrap")?;
+    let (_, payload) = transcript.requests.get(2).ok_or("no bootstrap")?;
     assert_eq!(payload, &b"\x00\x05t41nq".to_vec());
     Ok(())
 }
@@ -2671,5 +2682,164 @@ fn a_refusal_that_cuts_the_image_short_is_reported_as_the_refusal() -> TestResul
         "the daemon's own words: {message}"
     );
     assert_eq!(code, TRANSFER);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// A daemon without loaders of its own
+// ---------------------------------------------------------------------------
+
+/// The `DISCOVER` row of a T31X in the bootrom.
+fn t31x_bootrom() -> Result<Vec<u8>, &'static str> {
+    Ok(discovered(
+        0,
+        WireVariant::from_name("t31x").ok_or("t31x has a wire name")?,
+    ))
+}
+
+/// **A daemon with no loaders of its own is sent the variant's pair**, from this
+/// machine's tree: a daemon on a microcontroller, which has no filesystem to keep one in.
+#[test]
+fn a_daemon_without_loaders_is_sent_the_variants_pair() -> TestResult {
+    let scratch = Scratch::new("remote-no-loaders")?;
+    scratch.loader_tree(tdfu_core::model::Variant::T31x)?;
+    let daemon = FakeDaemon::start(
+        false,
+        vec![
+            vec![Step::Ok(t31x_bootrom()?)],
+            info_with(tdfu_proto::Loaders::Absent),
+            vec![Step::Ok(ok())],
+        ],
+    )?;
+    let root = scratch.root().display().to_string();
+    let plan = plan_for(daemon.port(), &["-b", "--firmware-dir", &root])?;
+    let outcome = drive(&plan);
+    let transcript = daemon.transcript()?;
+
+    assert!(outcome.result.is_ok(), "{:?}", outcome.refusal());
+    let commands: Vec<u8> = transcript.requests.iter().map(|(command, _)| *command).collect();
+    assert_eq!(
+        commands,
+        vec![
+            Command::Discover.wire_byte(),
+            Command::Info.wire_byte(),
+            Command::Bootstrap.wire_byte()
+        ]
+    );
+    let (_, payload) = transcript.requests.get(2).ok_or("no bootstrap")?;
+    let expected = tdfu_proto::Request::Bootstrap {
+        index: 0,
+        variant: Vec::new(),
+        blobs: Some(tdfu_proto::Blobs {
+            spl: b"stage-1".to_vec(),
+            uboot: b"u-boot".to_vec(),
+        }),
+    }
+    .encode()?;
+    assert_eq!(payload, &expected, "the pair, and no variant for the daemon to resolve");
+    assert!(
+        outcome.err.contains("has no loaders of its own; sending"),
+        "{}",
+        outcome.err
+    );
+    Ok(())
+}
+
+/// A daemon that predates the question refuses it as an unknown command and keeps the
+/// connection, and is sent the variant as before: every daemon before it had a tree.
+#[test]
+fn an_older_daemon_is_sent_the_variant() -> TestResult {
+    let daemon = FakeDaemon::start(
+        false,
+        vec![
+            vec![Step::Ok(t31x_bootrom()?)],
+            vec![Step::Fail("unknown command".to_owned())],
+            vec![Step::Ok(ok())],
+        ],
+    )?;
+    let plan = plan_for(daemon.port(), &["-b"])?;
+    let outcome = drive(&plan);
+    let transcript = daemon.transcript()?;
+
+    assert!(outcome.result.is_ok(), "{:?}", outcome.refusal());
+    let (command, payload) = transcript.requests.get(2).ok_or("no bootstrap")?;
+    assert_eq!(*command, Command::Bootstrap.wire_byte());
+    assert_eq!(payload, &b"\x00\x04t31x".to_vec());
+    Ok(())
+}
+
+/// A pair given with `--spl` and `--uboot` is sent whatever the daemon has, so the
+/// daemon is not asked.
+#[test]
+fn a_custom_pair_is_sent_without_asking() -> TestResult {
+    let scratch = Scratch::new("remote-custom-pair")?;
+    let spl = scratch.write("spl.bin", b"custom-spl")?;
+    let uboot = scratch.write("uboot.bin", b"custom-uboot")?;
+    let daemon = FakeDaemon::start(false, vec![vec![Step::Ok(t31x_bootrom()?)], vec![Step::Ok(ok())]])?;
+    let plan = plan_for(
+        daemon.port(),
+        &[
+            "-b",
+            "--spl",
+            &spl.display().to_string(),
+            "--uboot",
+            &uboot.display().to_string(),
+        ],
+    )?;
+    let outcome = drive(&plan);
+    let transcript = daemon.transcript()?;
+
+    assert!(outcome.result.is_ok(), "{:?}", outcome.refusal());
+    let commands: Vec<u8> = transcript.requests.iter().map(|(command, _)| *command).collect();
+    assert_eq!(
+        commands,
+        vec![Command::Discover.wire_byte(), Command::Bootstrap.wire_byte()]
+    );
+    Ok(())
+}
+
+/// `--firmware-dir` is for a daemon without loaders. One with a tree of its own would
+/// ignore it and upload its own, so the bootstrap is refused before it is sent.
+#[test]
+fn a_daemon_with_a_tree_refuses_a_local_firmware_dir() -> TestResult {
+    let scratch = Scratch::new("remote-tree-and-dir")?;
+    scratch.loader_tree(tdfu_core::model::Variant::T31x)?;
+    let daemon = FakeDaemon::start(
+        false,
+        vec![vec![Step::Ok(t31x_bootrom()?)], info_with(tdfu_proto::Loaders::Tree)],
+    )?;
+    let root = scratch.root().display().to_string();
+    let plan = plan_for(daemon.port(), &["-b", "--firmware-dir", &root])?;
+    let outcome = drive(&plan);
+    let transcript = daemon.transcript()?;
+
+    let (message, code) = outcome.refusal()?;
+    assert!(message.contains("bootstraps from its own"), "{message}");
+    assert!(message.contains("--spl and --uboot"), "the way out: {message}");
+    assert_eq!(code, DEVICE);
+    assert_eq!(transcript.requests.len(), 2, "no bootstrap went out");
+    Ok(())
+}
+
+/// A daemon without loaders, and none on this machine either: a file problem, exit 3,
+/// saying where the pair was looked for and how to get it.
+#[test]
+fn a_daemon_without_loaders_and_none_here_is_a_file_error() -> TestResult {
+    let scratch = Scratch::new("remote-no-loaders-anywhere")?;
+    let daemon = FakeDaemon::start(
+        false,
+        vec![vec![Step::Ok(t31x_bootrom()?)], info_with(tdfu_proto::Loaders::Absent)],
+    )?;
+    let root = scratch.root().display().to_string();
+    let plan = plan_for(daemon.port(), &["-b", "--firmware-dir", &root])?;
+    let outcome = drive(&plan);
+    let transcript = daemon.transcript()?;
+
+    let (message, code) = outcome.refusal()?;
+    assert!(message.contains("has no loaders of its own"), "{message}");
+    assert!(message.contains(&root), "where it looked: {message}");
+    assert!(message.contains("fetch-loaders"), "how to get them: {message}");
+    assert_eq!(code, FILE);
+    assert_eq!(transcript.requests.len(), 2, "no bootstrap went out");
     Ok(())
 }
