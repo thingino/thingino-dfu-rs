@@ -1,4 +1,4 @@
-//! The nine commands, and the one place a request becomes work.
+//! The ten commands, and the one place a request becomes work.
 //!
 //! # The seam
 //!
@@ -37,7 +37,7 @@ pub mod fake;
 use tdfu_core::clock::Sleeper;
 use tdfu_core::model::{AltSel, Variant};
 use tdfu_core::{Error, Result as CoreResult};
-use tdfu_proto::{Command, ProgressBody, Request, Status, exceeds_payload_cap};
+use tdfu_proto::{Command, DaemonInfo, Loaders, ProgressBody, Request, Status, exceeds_payload_cap};
 use tdfu_usb::LocalUsbBackend;
 
 use crate::errors::DaemonError;
@@ -307,6 +307,7 @@ where
             tracing::debug!(activity = %state.activity(), "cancel requested");
             Ok(Reply::ok())
         }
+        Request::Info => Ok(Reply::Ok(info(state).encode())),
         Request::Diag { index } => diag::handle(state, index).await,
         Request::Reboot { index } => reboot::handle(conn, state, index).await,
         // `Request` is `#[non_exhaustive]` and lives in another crate. A command added
@@ -314,6 +315,21 @@ where
         // than being silently ignored.
         _ => Ok(Reply::Error("unknown command".to_owned())),
     }
+}
+
+/// What this daemon says about itself (`CMD_INFO`).
+///
+/// **The loader tree is looked for, not configured.** A `BOOTSTRAP` that carries no pair
+/// is answered from `<firmware>/dfu/<variant>/`, so a client has to send the pair exactly
+/// when that directory is missing: on a daemon with no filesystem, and on a host whose
+/// tree was never fetched.
+fn info<B, C>(state: &DaemonState<B, C>) -> DaemonInfo {
+    let loaders = if state.firmware_dir().join(tdfu_core::loader::LOADER_SUBDIR).is_dir() {
+        Loaders::Tree
+    } else {
+        Loaders::Absent
+    };
+    DaemonInfo::new(tdfu_core::build::version_line(), loaders)
 }
 
 /// [`Request::is_erase`] behind a name, so the `match` guard above reads as the rule it
@@ -550,6 +566,7 @@ mod tests {
             (Command::Bootstrap, vec![0, 0]),
             (Command::Write, vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
             (Command::Read, vec![0, 0]),
+            (Command::Info, Vec::new()),
         ] {
             let mut conn = LoopbackConn::raw();
             let mut state = daemon(FakeBackend::empty());
@@ -821,6 +838,37 @@ mod tests {
             assert_eq!(conn.drained(), 5000, "{command:?}");
             assert_eq!(state.activity(), Activity::Idle);
         }
+        Ok(())
+    }
+
+    /// `CMD_INFO` names the daemon's version and whether it has a loader tree, which is
+    /// what tells a client to send the pair with a `BOOTSTRAP`.
+    #[test]
+    fn rpc_info_says_whether_there_is_a_loader_tree() -> TestResult {
+        let scratch = crate::commands::fake::Scratch::new("info-tree")?;
+        scratch.loader_tree(Variant::T31x)?;
+        let mut conn = LoopbackConn::raw();
+        let mut state = DaemonState::new(FakeBackend::empty(), RecordingClock::new(), scratch.root());
+        block_on(dispatch(&mut conn, &mut state, Command::Info, &[]))?;
+        let Some((Status::Ok, payload)) = conn.response() else {
+            return Err(format!("expected an answer, got {:?}", conn.sent()).into());
+        };
+        let info = tdfu_proto::DaemonInfo::decode(&payload);
+        assert_eq!(info.loaders, Some(tdfu_proto::Loaders::Tree));
+        assert_eq!(info.version, Some(tdfu_core::build::version_line()));
+
+        // No tree where the daemon looks, as on a daemon with no filesystem.
+        let mut conn = LoopbackConn::raw();
+        let mut state = daemon(FakeBackend::empty());
+        block_on(dispatch(&mut conn, &mut state, Command::Info, &[]))?;
+        let Some((Status::Ok, payload)) = conn.response() else {
+            return Err(format!("expected an answer, got {:?}", conn.sent()).into());
+        };
+        assert_eq!(
+            tdfu_proto::DaemonInfo::decode(&payload).loaders,
+            Some(tdfu_proto::Loaders::Absent)
+        );
+        assert_eq!(state.activity(), Activity::Idle, "asking claims nothing");
         Ok(())
     }
 }

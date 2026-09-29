@@ -562,7 +562,7 @@ impl Conn {
     /// asserted nothing was restating that signature, not checking it. What
     /// the rule *is* is pinned on the wire, by `rpc_log_frames_when` and
     /// `the_seam_accessors_answer_for_a_real_connection` in `tests/transport.rs`, which
-    /// build real connections of all three kinds and ask all nine commands.
+    /// build real connections of all three kinds and ask all ten commands.
     #[must_use]
     pub const fn logs_enabled_for(&self, cmd: Command) -> bool {
         match self {

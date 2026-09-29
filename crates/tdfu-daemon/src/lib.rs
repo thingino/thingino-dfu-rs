@@ -24,7 +24,7 @@
 //! correct.
 
 //! The map: `transport/` and `auth` are the wire (framing, the three transports, the
-//! token handshake); `commands/` and `errors` are the nine commands and the
+//! token handshake); `commands/` and `errors` are the ten commands and the
 //! `Error` → `ERROR_STRINGS` mapper; `serve` is the accept loop that joins the two;
 //! `listen`, `clock` and `logging` are what the binary needs and the library can test.
 
