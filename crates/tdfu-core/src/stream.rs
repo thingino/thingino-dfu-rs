@@ -35,6 +35,14 @@ pub trait AsyncSource {
     /// # Errors
     /// Whatever the origin reports, or the early end.
     async fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()>;
+
+    /// The most a reader should hold of this source at once, when that must be less than
+    /// its own unit of work. A frontend streams an image because it cannot hold one, and
+    /// a 64 KiB bootrom chunk held on its behalf fails on a microcontroller with no
+    /// external RAM. `None`, the default, leaves the reader its own chunking.
+    fn hold_at_most(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// A synchronous writer as a sink: what [`ops::read`](crate::ops::read) has always taken.
@@ -113,6 +121,10 @@ impl<S: AsyncSource> AsyncSource for Padded<'_, S> {
         tail.fill(0);
         Ok(())
     }
+
+    fn hold_at_most(&self) -> Option<usize> {
+        self.inner.hold_at_most()
+    }
 }
 
 #[cfg(test)]
@@ -148,6 +160,25 @@ mod tests {
         block_on(sink.write_all(b"two"))?;
         assert_eq!(out, b"one two");
         Ok(())
+    }
+
+    /// Padding a source keeps what it asked about being held, or a padded U-Boot would be
+    /// chunked as though the frontend had room for a whole chunk.
+    #[test]
+    fn padding_keeps_the_hold_hint() {
+        struct Tight;
+        impl AsyncSource for Tight {
+            async fn read_exact(&mut self, _buf: &mut [u8]) -> io::Result<()> {
+                Ok(())
+            }
+            fn hold_at_most(&self) -> Option<usize> {
+                Some(4096)
+            }
+        }
+        let mut tight = Tight;
+        assert_eq!(Padded::new(&mut tight, 10).hold_at_most(), Some(4096));
+        let mut slice = SliceSource::new(b"abc");
+        assert_eq!(Padded::new(&mut slice, 3).hold_at_most(), None);
     }
 
     #[test]

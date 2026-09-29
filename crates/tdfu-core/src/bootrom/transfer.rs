@@ -143,9 +143,20 @@ pub async fn load_from<T: LocalUsbTransport, C: Sleeper, S: AsyncSource>(
 
 /// Where the chunk loop takes each chunk from.
 trait Chunks {
-    /// Bytes `start..end` of the image. Called once per chunk, in order.
+    /// Bytes `start..end` of the image. Called once per range, in order.
     async fn chunk(&mut self, start: usize, end: usize) -> Result<&[u8]>;
+
+    /// The most one bulk transfer takes from here: a whole [`BULK_CHUNK`] unless the image
+    /// is streamed from a source that can only be held in smaller pieces.
+    fn piece(&self) -> usize {
+        BULK_CHUNK
+    }
 }
+
+/// What a piece is a multiple of: a bulk transfer that ends mid-image must end on a
+/// packet boundary at either speed, or the bootrom sees a short packet where there is
+/// more to come.
+const PIECE_UNIT: usize = 512;
 
 /// An image in memory.
 struct FromSlice<'a>(&'a [u8]);
@@ -168,6 +179,12 @@ struct FromSource<'s, S> {
 }
 
 impl<S: AsyncSource> Chunks for FromSource<'_, S> {
+    fn piece(&self) -> usize {
+        self.source.hold_at_most().map_or(BULK_CHUNK, |hold| {
+            (hold - hold % PIECE_UNIT).clamp(PIECE_UNIT, BULK_CHUNK)
+        })
+    }
+
     async fn chunk(&mut self, start: usize, end: usize) -> Result<&[u8]> {
         self.buf.resize(end.saturating_sub(start), 0);
         self.source.read_exact(&mut self.buf).await.map_err(|cause| {
@@ -194,59 +211,19 @@ async fn transfer_chunks<T: LocalUsbTransport, C: Sleeper, K: Chunks>(
     let mut offset = 0_usize;
 
     while offset < total {
-        let chunk_start = offset;
         let chunk_end = total.min(offset + BULK_CHUNK);
-        let data = chunks.chunk(chunk_start, chunk_end).await?;
-        // The C never resets this budget, so three partial writes in a row
-        // fail a chunk that made progress every time. Progress resets it here.
-        let mut attempts_left = CHUNK_ATTEMPTS;
-
+        // One bulk transfer per chunk, or one per piece of it when the image streams from
+        // a source held a piece at a time: the same packets reach the bootrom either way.
         while offset < chunk_end {
-            // What is left of this chunk after any partial writes.
-            let Some(chunk) = data.get(offset.saturating_sub(chunk_start)..) else {
-                return Err(Error::Protocol(format!(
-                    "chunk {offset}..{chunk_end} is outside the {total}-byte image"
-                )));
-            };
-            match bulk_out_chunk(dev, chunk).await {
-                Ok(written) if written > 0 => {
-                    offset += written;
-                    attempts_left = CHUNK_ATTEMPTS;
-                }
-                Ok(_) => {
-                    // No error and no bytes. The C spends an attempt on this too and
-                    // gives up on the last one (`bootstrap.c:155-160`).
-                    //
-                    // `saturating_sub`, not `-= 1`: the loop returns at zero so it cannot
-                    // underflow today, but that is an invariant two branches away rather
-                    // than a local fact, and a debug-build panic here would abort a
-                    // flashing tool mid-write.
-                    attempts_left = attempts_left.saturating_sub(1);
-                    if attempts_left == 0 {
-                        return Err(Error::Protocol(format!(
-                            "the bootrom accepted 0 of {} bytes and reported no error",
-                            chunk.len()
-                        )));
-                    }
-                    clock.sleep(CHUNK_RETRY_DELAY).await;
-                }
-                Err(err) => {
-                    // A halted bulk endpoint latches until CLEAR_FEATURE(ENDPOINT_HALT),
-                    // so without this the retry below is decorative.
-                    clear_halt_if_stalled(dev, endpoint::BOOTROM_OUT, &err).await;
-                    attempts_left = attempts_left.saturating_sub(1);
-                    // The C retries *any* error here (`bootstrap.c:138-148`); this
-                    // module has one retry class instead of two, the vendor class
-                    // `{Timeout, Stall, NoDevice}`. It is the class the transport
-                    // answers for, and it keeps a scripted
-                    // `Backend` mismatch — a test double disagreeing with the code —
-                    // from being papered over by three retries.
-                    if !err.is_vendor_retryable() || attempts_left == 0 {
-                        return Err(err.into());
-                    }
-                    clock.sleep(CHUNK_RETRY_DELAY).await;
-                }
-            }
+            offset = send_piece(
+                dev,
+                clock,
+                offset,
+                chunk_end.min(offset.saturating_add(chunks.piece())),
+                total,
+                chunks,
+            )
+            .await?;
         }
 
         progress(Progress::Bytes {
@@ -262,6 +239,72 @@ async fn transfer_chunks<T: LocalUsbTransport, C: Sleeper, K: Chunks>(
         }
     }
     Ok(())
+}
+
+/// Bytes `start..end` of the image as one bulk transfer, with the retries and partial
+/// writes of [`transfer_chunks`]; answers where it got to, which is `end`.
+async fn send_piece<T: LocalUsbTransport, C: Sleeper, K: Chunks>(
+    dev: &T,
+    clock: &C,
+    start: usize,
+    end: usize,
+    total: usize,
+    chunks: &mut K,
+) -> Result<usize> {
+    let data = chunks.chunk(start, end).await?;
+    let mut offset = start;
+    // The C never resets this budget, so three partial writes in a row
+    // fail a chunk that made progress every time. Progress resets it here.
+    let mut attempts_left = CHUNK_ATTEMPTS;
+
+    while offset < end {
+        // What is left of this piece after any partial writes.
+        let Some(chunk) = data.get(offset.saturating_sub(start)..) else {
+            return Err(Error::Protocol(format!(
+                "chunk {offset}..{end} is outside the {total}-byte image"
+            )));
+        };
+        match bulk_out_chunk(dev, chunk).await {
+            Ok(written) if written > 0 => {
+                offset += written;
+                attempts_left = CHUNK_ATTEMPTS;
+            }
+            Ok(_) => {
+                // No error and no bytes. The C spends an attempt on this too and
+                // gives up on the last one (`bootstrap.c:155-160`).
+                //
+                // `saturating_sub`, not `-= 1`: the loop returns at zero so it cannot
+                // underflow today, but that is an invariant two branches away rather
+                // than a local fact, and a debug-build panic here would abort a
+                // flashing tool mid-write.
+                attempts_left = attempts_left.saturating_sub(1);
+                if attempts_left == 0 {
+                    return Err(Error::Protocol(format!(
+                        "the bootrom accepted 0 of {} bytes and reported no error",
+                        chunk.len()
+                    )));
+                }
+                clock.sleep(CHUNK_RETRY_DELAY).await;
+            }
+            Err(err) => {
+                // A halted bulk endpoint latches until CLEAR_FEATURE(ENDPOINT_HALT),
+                // so without this the retry below is decorative.
+                clear_halt_if_stalled(dev, endpoint::BOOTROM_OUT, &err).await;
+                attempts_left = attempts_left.saturating_sub(1);
+                // The C retries *any* error here (`bootstrap.c:138-148`); this
+                // module has one retry class instead of two, the vendor class
+                // `{Timeout, Stall, NoDevice}`. It is the class the transport
+                // answers for, and it keeps a scripted
+                // `Backend` mismatch — a test double disagreeing with the code —
+                // from being papered over by three retries.
+                if !err.is_vendor_retryable() || attempts_left == 0 {
+                    return Err(err.into());
+                }
+                clock.sleep(CHUNK_RETRY_DELAY).await;
+            }
+        }
+    }
+    Ok(offset)
 }
 
 /// One bulk-OUT attempt, in bytes the device accepted.
@@ -340,15 +383,39 @@ mod tests {
 
     /// The two vendor requests plus the chunk expectations a staged image produces.
     fn staging(dev: MockTransport, addr: u32, data: &[u8]) -> MockTransport {
+        staging_in_pieces(dev, addr, data, BULK_CHUNK)
+    }
+
+    /// [`staging`], with every chunk sent as bulk transfers of at most `piece` bytes.
+    fn staging_in_pieces(dev: MockTransport, addr: u32, data: &[u8], piece: usize) -> MockTransport {
         let len = u32::try_from(data.len()).unwrap_or(u32::MAX);
         let mut dev = dev
             .expecting(vendor_out_word(request::SET_DATA_ADDR, addr), Reply::Done)
             .expecting(vendor_out_word(request::SET_DATA_LEN, len), Reply::Done)
             .expecting(Call::ClaimInterface(INTERFACE), Reply::Done);
         for chunk in data.chunks(BULK_CHUNK) {
-            dev = dev.expecting(Call::BulkOut { data: chunk.to_vec() }, Reply::Done);
+            for part in chunk.chunks(piece) {
+                dev = dev.expecting(Call::BulkOut { data: part.to_vec() }, Reply::Done);
+            }
         }
         dev.expecting(Call::ReleaseInterface(0), Reply::Done)
+    }
+
+    /// A source that asks to be held `hold` bytes at a time.
+    struct Held<'a> {
+        inner: SliceSource<'a>,
+        hold: usize,
+    }
+
+    impl crate::stream::AsyncSource for Held<'_> {
+        async fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+            assert!(buf.len() <= self.hold.max(512), "asked for {} bytes at once", buf.len());
+            self.inner.read_exact(buf).await
+        }
+
+        fn hold_at_most(&self) -> Option<usize> {
+            Some(self.hold)
+        }
     }
 
     /// Address, length, one bulk IN of exactly `len` at 2 s.
@@ -855,5 +922,77 @@ mod tests {
         assert_eq!(clock_stream.slept(), clock_slice.slept(), "the same delays");
         assert_eq!(source.remaining(), 0);
         Ok(())
+    }
+
+    /// **A source held a piece at a time is sent a piece at a time**: each chunk goes out
+    /// as bulk transfers of the piece, never reading more of the source than that, with
+    /// the chunk's own progress and delays, so a microcontroller streaming U-Boot never
+    /// holds a whole 64 KiB chunk.
+    #[test]
+    fn a_source_held_in_pieces_is_sent_in_pieces() -> TestResult {
+        let data = image(INTER_CHUNK_DELAY_THRESHOLD + 1);
+        let piece = 16 * 1024;
+
+        let clock_slice = RecordingClock::new();
+        let mut whole = Vec::new();
+        let dev = staging(
+            MockTransport::new(bootrom()).configured(CONFIGURATION),
+            UBOOT_ADDR,
+            &data,
+        );
+        block_on(load_to_memory(&dev, &clock_slice, UBOOT_ADDR, &data, &mut |p| {
+            whole.push(p);
+        }))?;
+        dev.verify()?;
+
+        let clock_held = RecordingClock::new();
+        let mut held = Vec::new();
+        let dev = staging_in_pieces(
+            MockTransport::new(bootrom()).configured(CONFIGURATION),
+            UBOOT_ADDR,
+            &data,
+            piece,
+        );
+        let mut source = Held {
+            inner: SliceSource::new(&data),
+            hold: piece,
+        };
+        block_on(super::load_from(
+            &dev,
+            &clock_held,
+            UBOOT_ADDR,
+            data.len(),
+            &mut source,
+            &mut |p| {
+                held.push(p);
+            },
+        ))?;
+        dev.verify()?;
+        assert_eq!(held, whole, "the chunk's progress");
+        assert_eq!(clock_held.slept(), clock_slice.slept(), "the chunk's delays");
+        Ok(())
+    }
+
+    /// A piece is whole packets at either speed, and never more than a chunk.
+    #[test]
+    fn a_piece_is_whole_packets_and_at_most_a_chunk() {
+        let data = [0_u8; 4];
+        for (hold, piece) in [
+            (5000, 4608),
+            (100, 512),
+            (0, 512),
+            (1 << 20, BULK_CHUNK),
+            (16384, 16384),
+        ] {
+            let mut source = Held {
+                inner: SliceSource::new(&data),
+                hold,
+            };
+            let chunks = super::FromSource {
+                source: &mut source,
+                buf: Vec::new(),
+            };
+            assert_eq!(super::Chunks::piece(&chunks), piece, "hold {hold}");
+        }
     }
 }
