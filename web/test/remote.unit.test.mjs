@@ -361,3 +361,27 @@ test('a refusal is not a success and not an empty bus', async () => {
     await c.connect('192.0.2.10:5050', '');
     assert.equal(await c.discover(), null, 'a refused listing is not a bus with no devices on it');
 });
+
+test('INFO reads the daemon\'s key=value lines and skips what it does not know', async () => {
+    const seen = scriptDaemon([frame(RESP_OK, 'version=2.0.1 (abc)\r\nmotd=hello\nloaders=none\n')]);
+    const { c, logs } = client();
+    await c.connect('192.0.2.10:5050', '');
+
+    assert.deepEqual(await c.info(), { version: '2.0.1 (abc)', loaders: 'none' });
+    assert.equal(seen.bodies[0][5], 0x0a, 'command 10');
+    assert.equal(payloadOf(seen.bodies[0]).length, 0, 'header-only');
+    assert.deepEqual(logs, []);
+
+    scriptDaemon([frame(RESP_OK, 'loaders=cloud\n')]);
+    assert.deepEqual(await c.info(), { version: null, loaders: null }, 'a value it does not know is not a guess');
+});
+
+test('a daemon that predates INFO is an answer, not an error line', async () => {
+    scriptDaemon([frame(RESP_ERROR, 'unknown command')]);
+    const { c, logs } = client();
+    await c.connect('192.0.2.10:5050', '');
+
+    assert.equal(await c.info(), null);
+    assert.deepEqual(logs, [], 'the refusal is not shown as ERROR');
+});
+

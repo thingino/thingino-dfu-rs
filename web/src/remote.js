@@ -20,6 +20,10 @@ const CMD_WRITE = 0x03;
 const CMD_READ = 0x04;
 const CMD_DIAG = 0x07;
 const CMD_REBOOT = 0x08;
+/* What the daemon is (crates/tdfu-proto/src/info.rs): key=value lines naming its
+ * version and whether it has a loader tree of its own. One that predates the
+ * question answers "unknown command" and keeps serving. */
+const CMD_INFO = 0x0A;
 
 const RESP_OK = 0x00;
 const RESP_ERROR = 0x01;
@@ -132,8 +136,9 @@ export class RemoteClient {
     isConnected() { return this.connected; }
 
     /* POST a TDFU command and parse the streamed TDFU responses, surfacing
-     * PROGRESS/LOG/DEBUG, returning the OK payload (or null on ERROR). */
-    async _command(command, payload) {
+     * PROGRESS/LOG/DEBUG, returning the OK payload (or null on ERROR). A quiet
+     * command's ERROR is its caller's to judge rather than a line for the log. */
+    async _command(command, payload, quiet) {
         const cmd = command;
         const pl = payload || new Uint8Array(0);
         const frame = new Uint8Array(10 + pl.length);
@@ -242,7 +247,7 @@ export class RemoteClient {
                  * string to branch on: no shipped client matched one, which is
                  * why the daemon was free to make them richer. */
                 const m = body.length ? new TextDecoder().decode(body) : 'unknown error';
-                this.onLog('ERROR: ' + stripOneNewline(m));
+                if (!quiet) this.onLog('ERROR: ' + stripOneNewline(m));
                 try { reader.cancel(); } catch (e) { /* ignore */ }
                 return null;
             }
@@ -272,6 +277,26 @@ export class RemoteClient {
             });
         }
         return devs;
+    }
+
+    /* What the daemon says about itself: { version, loaders }, loaders being
+     * 'tree', 'none' or null when it did not say, or null when it refused the
+     * question. Asked quietly, because a daemon that predates the question
+     * refusing it is an answer ("it has a tree, as every daemon before it did"),
+     * not an error to show. Unknown keys are skipped, so a daemon can say more. */
+    async info() {
+        const body = await this._command(CMD_INFO, null, true);
+        if (!body) return null;
+        const out = { version: null, loaders: null };
+        for (const line of new TextDecoder().decode(body).split(/\r?\n/)) {
+            const at = line.indexOf('=');
+            if (at < 0) continue;
+            const key = line.slice(0, at).trim();
+            const value = line.slice(at + 1).trim();
+            if (key === 'version') out.version = value;
+            else if (key === 'loaders') out.loaders = value === 'tree' || value === 'none' ? value : null;
+        }
+        return out;
     }
 
     /* The readout, as text. This daemon's DIAG payload carries no trailing

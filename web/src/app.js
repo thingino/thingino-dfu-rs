@@ -1317,11 +1317,28 @@ async function doRemoteBootstrap() {
     showProgressBusy('Bootstrapping via daemon...');
     log('Remote bootstrap for ' + (detectedVariantName || '').toUpperCase() + '...');
     try {
-        var custom = !!(customSpl && customUboot);
-        if (custom)
+        var spl = null, uboot = null;
+        if (customSpl && customUboot) {
             log('Using custom SPL (' + customSpl.data.length + ' B) + U-Boot (' + customUboot.data.length + ' B)');
-        var ok = await remoteClient.bootstrap(selectedRemoteIndex, detectedVariantName,
-                                              custom ? customSpl.data : null, custom ? customUboot.data : null);
+            spl = customSpl.data; uboot = customUboot.data;
+        } else {
+            /* A daemon with no loader tree of its own - the ESP32 backpack - is sent
+             * this page's pair for the detected SoC, the same files a WebUSB bootstrap
+             * uploads. One with a tree, or one that predates the question (null), is
+             * sent the variant alone, as before. */
+            var info = await remoteClient.info();
+            if (info && info.loaders === 'none') {
+                if (!detectedVariantName || detectedVariantName === 'unknown') {
+                    log('Remote bootstrap failed: the daemon has no loaders of its own and the SoC is unknown, ' +
+                        'so this page cannot pick a pair. Choose the SPL and U-Boot under Advanced.', 'error');
+                    hideProgress(); setState('error'); return;
+                }
+                var own = await fetchDfuLoaders(detectedVariantName);
+                spl = own.spl; uboot = own.uboot;
+                log('The daemon has no loaders of its own; sending this page\'s ' + detectedVariantName + ' pair.');
+            }
+        }
+        var ok = await remoteClient.bootstrap(selectedRemoteIndex, detectedVariantName, spl, uboot);
         if (!ok) { log('Remote bootstrap failed.', 'error'); hideProgress(); setState('error'); return; }
         log('Remote bootstrap complete.');
         // The device re-enumerates bootrom -> U-Boot DFU gadget, which takes a

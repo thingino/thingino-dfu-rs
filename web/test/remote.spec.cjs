@@ -249,7 +249,7 @@ async function main() {
         if (!dfu && process.env.TDFU_BOOTSTRAP === '1') {
             console.log('remote.spec: bootstrap');
             await page.click('#btn-bootstrap');
-            await waitForLog(page, /ready to Read\/Write|did not reappear|bootstrap failed/i, OP_TIMEOUT, 'bootstrap');
+            await waitForLog(page, /ready to Read\/Write|did not reappear|bootstrap failed|bootstrap error/i, OP_TIMEOUT, 'bootstrap');
             dfu = await page.$eval('#btn-read', (b) => !b.disabled);
         }
         if (!dfu) {
