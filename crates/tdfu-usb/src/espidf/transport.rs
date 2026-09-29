@@ -330,6 +330,7 @@ impl EspTransport {
                 dev: Raw(dev),
                 address: self.address.get(),
                 ep0_inflight,
+                since: Instant::now(),
             });
             return;
         }
@@ -568,6 +569,7 @@ impl LocalUsbTransport for EspTransport {
                 dev: Raw(old),
                 address: self.address.get(),
                 ep0_inflight,
+                since: Instant::now(),
             });
         }
         // SAFETY: the library is installed.

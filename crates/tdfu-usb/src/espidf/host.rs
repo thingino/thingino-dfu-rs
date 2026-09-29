@@ -7,7 +7,7 @@ use core::fmt;
 use core::ptr;
 use core::time::Duration;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::Instant;
@@ -31,6 +31,9 @@ const HPRT_POWERED: u32 = 1 << 12;
 /// enumeration counts as abandoned. A healthy one is listed within about a second.
 const ABANDONED_AFTER: Duration = Duration::from_secs(2);
 const LONGEST_RETRY: Duration = Duration::from_secs(60);
+/// A port empty this long ends a run of failed enumerations: whatever failed has left, and
+/// the watcher's own power cycles leave it empty for well under this.
+const FORGET_AFTER: Duration = Duration::from_secs(5);
 const WATCH_EVERY: Duration = Duration::from_millis(250);
 const PORT_OFF_FOR: Duration = Duration::from_millis(500);
 
@@ -38,6 +41,8 @@ pub(super) struct Shared {
     client: OnceLock<Raw<ClientHandle>>,
     state: Mutex<HostState>,
     changed: Condvar,
+    /// Port power cycles in a row that did not get the attached device enumerated.
+    failed_retries: AtomicU32,
 }
 
 #[derive(Default)]
@@ -75,6 +80,7 @@ pub(super) struct Deferred {
     pub(super) dev: Raw<DevHandle>,
     pub(super) address: u8,
     pub(super) ep0_inflight: Arc<AtomicUsize>,
+    pub(super) since: Instant,
 }
 
 impl Shared {
@@ -192,7 +198,9 @@ unsafe extern "C" fn client_event(msg: *const sys::usb_host_client_event_msg_t, 
 }
 
 /// The installed ESP-IDF USB Host Library, with this program's one client: the
-/// [`LocalUsbBackend`] for the OTG port.
+/// [`LocalUsbBackend`] for the OTG port. A clone is another handle on the same library
+/// and client, for watching the port from another thread.
+#[derive(Clone)]
 pub struct UsbHost {
     shared: Arc<Shared>,
 }
@@ -232,6 +240,7 @@ impl UsbHost {
             client: OnceLock::new(),
             state: Mutex::default(),
             changed: Condvar::new(),
+            failed_retries: AtomicU32::new(0),
         });
         // SAFETY: all-zero is a valid starting point; every field used is set below.
         let mut client_config: sys::usb_host_client_config_t = unsafe { core::mem::zeroed() };
@@ -254,11 +263,41 @@ impl UsbHost {
             }
         })?;
         if is_esp32s3() {
-            spawn("usb-watch", retry_abandoned_enumerations)?;
+            let watched = Arc::clone(&shared);
+            spawn("usb-watch", move || retry_abandoned_enumerations(&watched))?;
         } else {
             tracing::warn!("usb: not an ESP32-S3, so abandoned enumerations are not retried");
         }
         Ok(Self { shared })
+    }
+
+    /// The addresses of the devices enumerated on the port. Handles kept for devices that
+    /// have left are closed first, so a device that left is not among them.
+    #[must_use]
+    pub fn enumerated(&self) -> Vec<u8> {
+        self.shared.reap();
+        addresses()
+    }
+
+    /// How long a device has been kept from closing by a control transfer given up on in
+    /// flight: the mark of a device that stopped serving USB without leaving the bus. Only
+    /// its leaving completes such a transfer.
+    #[must_use]
+    pub fn stuck_for(&self) -> Option<Duration> {
+        self.shared.reap();
+        self.shared
+            .state()
+            .deferred
+            .iter()
+            .map(|entry| entry.since.elapsed())
+            .max()
+    }
+
+    /// How many port power cycles in a row have not got an attached device enumerated;
+    /// zero once one is.
+    #[must_use]
+    pub fn failed_enumerations(&self) -> u32 {
+        self.shared.failed_retries.load(Ordering::Relaxed)
     }
 }
 
@@ -273,9 +312,10 @@ fn is_esp32s3() -> bool {
 /// is listed and nothing looks at the port again until the device is unplugged. A device
 /// attached to a powered port with nothing enumerated is power-cycled, which enumerates it
 /// afresh.
-fn retry_abandoned_enumerations() {
+fn retry_abandoned_enumerations(shared: &Shared) {
     let hprt = ptr::with_exposed_provenance::<u32>(HPRT);
     let mut since: Option<Instant> = None;
+    let mut empty_since: Option<Instant> = None;
     let mut wait = ABANDONED_AFTER;
     loop {
         thread::sleep(WATCH_EVERY);
@@ -285,6 +325,14 @@ fn retry_abandoned_enumerations() {
         let listed = !addresses().is_empty();
         if listed {
             wait = ABANDONED_AFTER;
+            shared.failed_retries.store(0, Ordering::Relaxed);
+        }
+        if port & HPRT_ATTACHED == 0 {
+            if empty_since.get_or_insert_with(Instant::now).elapsed() >= FORGET_AFTER {
+                shared.failed_retries.store(0, Ordering::Relaxed);
+            }
+        } else {
+            empty_since = None;
         }
         if listed || port & (HPRT_ATTACHED | HPRT_POWERED) != HPRT_ATTACHED | HPRT_POWERED {
             since = None;
@@ -299,6 +347,7 @@ fn retry_abandoned_enumerations() {
         thread::sleep(PORT_OFF_FOR);
         // SAFETY: as above.
         unsafe { sys::usb_host_lib_set_root_port_power(true) };
+        shared.failed_retries.fetch_add(1, Ordering::Relaxed);
         since = None;
         wait = (wait * 2).min(LONGEST_RETRY);
     }
