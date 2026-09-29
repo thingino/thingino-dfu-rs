@@ -5,7 +5,7 @@
 //! preflight and the exit-code mapping — and the backend handed in is one that **fails on
 //! any use**, so a remote run that touches the local bus fails loudly instead of passing.
 
-use super::fake::{FakeDaemon, Step, closed_port};
+use super::fake::{FakeDaemon, Gate, Step, closed_port};
 use crate::cli::Cli;
 use crate::exit::{DEVICE, FILE, PROTOCOL, TRANSFER};
 use crate::fake::{FakeBackend, Scratch, TestResult};
@@ -2557,5 +2557,119 @@ fn the_daemons_narration_reads_as_the_local_narration_does() -> TestResult {
         "narration is not a log line: {}",
         outcome.err
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// A daemon that streams the image
+// ---------------------------------------------------------------------------
+
+/// Bigger than a loopback's send and receive buffers hold between them, so a client
+/// whose image is this long is still in its send until the daemon takes the image.
+const STREAMED_IMAGE: usize = 24 * 1024 * 1024;
+
+/// A stderr that opens `gate` once `needle` has been written to it.
+struct Watching {
+    seen: Vec<u8>,
+    needle: &'static str,
+    gate: std::sync::Arc<Gate>,
+}
+
+impl std::io::Write for Watching {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.seen.extend_from_slice(buf);
+        if String::from_utf8_lossy(&self.seen).contains(self.needle) {
+            self.gate.open();
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// **The daemon's progress is drawn while the image is still going out.** A daemon
+/// without room for the image takes it as fast as it writes it to the device, so the
+/// send lasts as long as the flash write, and a client that sent first and read
+/// afterwards drew nothing for all of it. Here the daemon answers a progress frame as
+/// soon as the header is in and will not take the image until that frame has been
+/// drawn, and the image is bigger than the socket buffers hold, so a client still
+/// sending cannot get there: the fake gives up and the write fails.
+#[test]
+fn the_daemon_s_progress_is_drawn_while_the_image_is_still_going_out() -> TestResult {
+    let scratch = Scratch::new("remote-streamed-write")?;
+    let image = vec![0x5A_u8; STREAMED_IMAGE];
+    let path = scratch.write("fw.bin", &image)?;
+    let gate = std::sync::Arc::new(Gate::default());
+    let daemon = FakeDaemon::start(
+        false,
+        vec![
+            vec![Step::Ok(discovered(2, WireVariant::UNKNOWN))],
+            vec![
+                Step::Progress {
+                    percent: 1,
+                    stage: 3,
+                    message: "262144/25165824 bytes".to_owned(),
+                },
+                Step::Wait(std::sync::Arc::clone(&gate)),
+                Step::ReadPayload,
+                Step::Ok(ok()),
+            ],
+        ],
+    )?;
+    let plan = plan_for(daemon.port(), &["-w", &path.display().to_string()])?;
+    let mut out = Vec::new();
+    let mut err = Watching {
+        seen: Vec::new(),
+        needle: "262144/25165824 bytes",
+        gate,
+    };
+    let backend = FakeBackend::failing(UsbError::new(
+        UsbErrorKind::Backend("a remote run must not touch the local bus".into()),
+        Pipe::Device,
+    ));
+    let result = block_on(run::run(&backend, &PatientClock::default(), &plan, &mut out, &mut err));
+    let transcript = daemon.transcript()?;
+    assert!(result.is_ok(), "{:?}", result.err().map(|failure| failure.to_string()));
+
+    // `[idx][vlen][alen][len][image][crc]`, all of it, taken after the frame was drawn.
+    let (_, payload) = transcript.requests.get(1).ok_or("the write never reached the wire")?;
+    assert_eq!(payload.len(), 3 + 4 + STREAMED_IMAGE + 4);
+    assert_eq!(payload.get(7..7 + STREAMED_IMAGE), Some(image.as_slice()));
+    Ok(())
+}
+
+/// A daemon that refuses without taking the image is reported by its refusal: the answer
+/// is read while the image is still going out, so the send the refusal cut short does not
+/// hide it behind a reset connection.
+#[test]
+fn a_refusal_that_cuts_the_image_short_is_reported_as_the_refusal() -> TestResult {
+    let scratch = Scratch::new("remote-streamed-refusal")?;
+    let path = scratch.write("fw.bin", &vec![0xA5_u8; STREAMED_IMAGE])?;
+    let daemon = FakeDaemon::start(
+        false,
+        vec![
+            vec![Step::Ok(discovered(2, WireVariant::UNKNOWN))],
+            vec![
+                Step::Fail("write failed: the flash alt is smaller than the image".to_owned()),
+                // Time for the answer to be read before the connection goes, then gone
+                // with the image unread.
+                Step::Pause(core::time::Duration::from_millis(500)),
+                Step::Close,
+                Step::ReadPayload,
+            ],
+        ],
+    )?;
+    let plan = plan_for(daemon.port(), &["-w", &path.display().to_string()])?;
+    let outcome = drive(&plan);
+    daemon.transcript()?;
+
+    let (message, code) = outcome.refusal()?;
+    assert!(
+        message.ends_with("could not complete the write: write failed: the flash alt is smaller than the image"),
+        "the daemon's own words: {message}"
+    );
+    assert_eq!(code, TRANSFER);
     Ok(())
 }

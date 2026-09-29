@@ -59,9 +59,10 @@
 //! be answered with before its final frame, which is the one fault a peer that is alive
 //! and talking can commit and none of the four above can see.
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use std::io::{self, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs as _};
+use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs as _};
 
 use tdfu_proto::{
     HEADER_LEN, ProgressBody, ProtoError, Request, RequestHeader, ResponseHeader, Status, exceeds_payload_cap,
@@ -390,25 +391,89 @@ impl Client {
     /// one-byte prefix is refused rather than silently becoming a different, valid alt —
     /// the audit's `tdfu-proto` finding), or if the socket fails while sending.
     pub fn send(&mut self, request: &Request, doing: &str) -> Result<(), RemoteError> {
-        let payload = request
-            .encode()
-            .map_err(|source| RemoteError::protocol(format!("this client cannot put {doing} on the wire: {source}")))?;
-        let Ok(payload_len) = u32::try_from(payload.len()) else {
-            return Err(too_big(doing, payload.len()));
-        };
-        if exceeds_payload_cap(payload_len) {
-            return Err(too_big(doing, payload.len()));
-        }
-        let header = RequestHeader {
-            command: request.command(),
-            payload_len,
-        };
-        self.write_all(&header.encode(), doing)?;
+        let (header, payload) = frame_of(request, doing)?;
+        self.write_all(&header, doing)?;
         if !payload.is_empty() {
             self.write_all(&payload, doing)?;
         }
-        tracing::debug!(command = ?request.command(), payload_len, "sent");
+        tracing::debug!(command = ?request.command(), payload_len = payload.len(), "sent");
         Ok(())
+    }
+
+    /// [`send`](Client::send) and [`finish`](Client::finish) at once: the request goes out
+    /// from a second thread while this one reads and renders the answer.
+    ///
+    /// **For a daemon that streams the image.** One without room for it reads the image
+    /// from the socket as it writes it to the device, so the send lasts as long as the
+    /// flash write, and sending first and reading afterwards drew nothing for all of it and
+    /// then every frame at once. A daemon that reads the whole request first is answered
+    /// as before: the send ends early and the frames follow.
+    ///
+    /// **Not for a conversation's first answer.** That one is read under
+    /// [`HANDSHAKE_TIMEOUT`], a deadline on an answer and not on an upload, so a first
+    /// command is sent in full before its answer is read, as [`send`](Client::send) does.
+    ///
+    /// # Errors
+    /// As [`send`](Client::send) and [`finish`](Client::finish). The daemon's own refusal
+    /// is reported over a send it cut short; otherwise whichever half failed first.
+    pub fn send_and_finish(
+        &mut self,
+        request: &Request,
+        doing: &str,
+        bar: &mut Bar,
+        err: &mut dyn Write,
+    ) -> Result<Vec<u8>, RemoteError> {
+        if self.awaiting_first_frame {
+            self.send(request, doing)?;
+            return self.finish(doing, bar, err);
+        }
+        let (header, payload) = frame_of(request, doing)?;
+        let mut out = self
+            .stream
+            .try_clone()
+            .map_err(|source| self.send_failed(&source, doing))?;
+        let read_failed = AtomicBool::new(false);
+        let send_failed_first = AtomicBool::new(false);
+        let (answered, sent) = std::thread::scope(|scope| {
+            let sending = scope.spawn(|| {
+                let sent = out.write_all(&header).and_then(|()| out.write_all(&payload));
+                match &sent {
+                    Ok(()) => tracing::debug!(command = ?request.command(), payload_len = payload.len(), "sent"),
+                    Err(source) => {
+                        if !read_failed.load(Ordering::SeqCst) {
+                            send_failed_first.store(true, Ordering::SeqCst);
+                        }
+                        // A daemon that has stopped reading will not answer either, and
+                        // the read would wait on it for good.
+                        if timed_out(source) {
+                            let _ignored = out.shutdown(Shutdown::Both);
+                        }
+                    }
+                }
+                sent
+            });
+            let answered = self.finish(doing, bar, err);
+            if answered.is_err() && !sending.is_finished() {
+                read_failed.store(true, Ordering::SeqCst);
+                // No answer is coming, so a send still waiting for the daemon to take
+                // the image must not wait for it.
+                let _ignored = self.stream.shutdown(Shutdown::Both);
+            }
+            (answered, sending.join())
+        });
+        let Ok(sent) = sent else {
+            return Err(RemoteError::protocol(format!(
+                "the thread sending {doing} to {} stopped unexpectedly",
+                self.at
+            )));
+        };
+        match (answered, sent) {
+            (Ok(payload), Ok(())) => Ok(payload),
+            (Err(refused @ RemoteError::Refused(_)), _) => Err(refused),
+            (Err(_), Err(source)) if send_failed_first.load(Ordering::SeqCst) => Err(self.send_failed(&source, doing)),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(source)) => Err(self.send_failed(&source, doing)),
+        }
     }
 
     /// Read frames until the final one, rendering everything on the way, and hand back
@@ -979,6 +1044,25 @@ fn short_file(error: RemoteError, path: &std::path::Path, written: u64) -> Remot
 /// `WSAETIMEDOUT`, so both kinds mean the same thing. Neither is reachable any other way
 /// on this socket: it is blocking throughout, and a deadline is armed only for the
 /// handshake and the first frame.
+/// A request as the header and payload that carry it, refused if the encoder refuses a
+/// field or the payload is over the cap.
+fn frame_of(request: &Request, doing: &str) -> Result<([u8; HEADER_LEN], Vec<u8>), RemoteError> {
+    let payload = request
+        .encode()
+        .map_err(|source| RemoteError::protocol(format!("this client cannot put {doing} on the wire: {source}")))?;
+    let Ok(payload_len) = u32::try_from(payload.len()) else {
+        return Err(too_big(doing, payload.len()));
+    };
+    if exceeds_payload_cap(payload_len) {
+        return Err(too_big(doing, payload.len()));
+    }
+    let header = RequestHeader {
+        command: request.command(),
+        payload_len,
+    };
+    Ok((header.encode(), payload))
+}
+
 fn timed_out(source: &io::Error) -> bool {
     matches!(source.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
 }

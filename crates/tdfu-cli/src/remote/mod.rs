@@ -435,8 +435,7 @@ impl Session<'_> {
             self.variant_for(index, entry.variant, err)?
         };
 
-        self.send(&Request::Bootstrap { index, variant, blobs }, doing::BOOTSTRAP)?;
-        self.finish(doing::BOOTSTRAP, err)?;
+        self.send_and_finish(&Request::Bootstrap { index, variant, blobs }, doing::BOOTSTRAP, err)?;
         // The stage this device reports has just changed, so the cached answer is stale.
         self.devices = None;
         self.say(
@@ -684,7 +683,7 @@ impl Session<'_> {
             ),
             err,
         );
-        self.send(
+        self.send_and_finish(
             &Request::Write {
                 index,
                 // No variant: the target is already a DFU gadget by now, and a gadget has
@@ -699,8 +698,8 @@ impl Session<'_> {
                 verify: verify.then_some(true),
             },
             doing,
+            err,
         )?;
-        self.finish(doing, err)?;
         Ok(())
     }
 
@@ -910,6 +909,12 @@ impl Session<'_> {
     /// Pump log and progress frames, and hand back the OK payload.
     fn finish(&mut self, doing: &str, err: &mut dyn Write) -> Result<Vec<u8>, RemoteError> {
         self.client.finish(doing, &mut self.bar, err)
+    }
+
+    /// Send a request carrying an image and render its answer while the image is still
+    /// going out ([`Client::send_and_finish`]).
+    fn send_and_finish(&mut self, request: &Request, doing: &str, err: &mut dyn Write) -> Result<Vec<u8>, RemoteError> {
+        self.client.send_and_finish(request, doing, &mut self.bar, err)
     }
 
     /// `-d`: ask the daemon for its core's narration, so the run reads as a local one.

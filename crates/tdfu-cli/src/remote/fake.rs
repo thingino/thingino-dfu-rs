@@ -13,6 +13,7 @@
 
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -58,8 +59,46 @@ pub enum Step {
     /// It costs real wall-clock time in the test that uses it, so it is used with
     /// milliseconds and an injected deadline, never with the shipped one.
     Pause(Duration),
+    /// Read the request's payload here, rather than before the reply starts, as a daemon
+    /// that streams the image does: it answers while the image is still arriving.
+    ///
+    /// A reply with this step anywhere in it reads only the request's header before its
+    /// first step, and the payload reaches the transcript when this step runs. One that
+    /// ends before reaching it never reads the payload at all: a daemon that answered
+    /// without taking the image.
+    ReadPayload,
+    /// Wait for the test to open this gate, and give up after [`PATIENCE`] with a note in
+    /// [`Transcript::trouble`]: a step that has to happen after something the client does.
+    Wait(Arc<Gate>),
     /// Close the connection here, mid-whatever.
     Close,
+}
+
+/// A signal from the test's side of the conversation, for a [`Step::Wait`].
+#[derive(Debug, Default)]
+pub struct Gate {
+    open: Mutex<bool>,
+    opened: Condvar,
+}
+
+impl Gate {
+    /// Let the step waiting on this go on.
+    pub fn open(&self) {
+        if let Ok(mut open) = self.open.lock() {
+            *open = true;
+            self.opened.notify_all();
+        }
+    }
+
+    /// Wait up to `patience` for [`open`](Gate::open); `true` if it came.
+    fn wait(&self, patience: Duration) -> bool {
+        let Ok(open) = self.open.lock() else {
+            return false;
+        };
+        self.opened
+            .wait_timeout_while(open, patience, |open| !*open)
+            .is_ok_and(|(open, _)| *open)
+    }
 }
 
 /// What the client actually sent.
@@ -204,15 +243,19 @@ fn serve(listener: &TcpListener, expect_token: bool, script: Vec<Vec<Step>>) -> 
     }
 
     for reply in steps {
-        match read_request(&mut stream) {
-            Ok(Some(request)) => transcript.requests.push(request),
+        let streamed = reply.iter().any(|step| matches!(step, Step::ReadPayload));
+        let unread = match read_request(&mut stream, streamed) {
+            Ok(Some((command, payload, unread))) => {
+                transcript.requests.push((command, payload));
+                unread
+            }
             Ok(None) => return transcript,
             Err(trouble) => {
                 transcript.trouble.push(trouble);
                 return transcript;
             }
-        }
-        if !play(&mut stream, &reply, &mut transcript) {
+        };
+        if !play_streamed(&mut stream, &reply, &mut transcript, unread) {
             return transcript;
         }
     }
@@ -259,8 +302,13 @@ fn read_handshake(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
     Ok(token)
 }
 
-/// One request header and its payload; `None` when the client closed cleanly.
-fn read_request(stream: &mut TcpStream) -> Result<Option<(u8, Vec<u8>)>, String> {
+/// A request as the fake has read it: the command byte, its payload, and how many payload
+/// bytes are still unread when only the header was taken.
+type Arrived = (u8, Vec<u8>, Option<u32>);
+
+/// One request header and its payload; `None` when the client closed cleanly. With
+/// `header_only` the payload is left unread and its length is handed back instead.
+fn read_request(stream: &mut TcpStream, header_only: bool) -> Result<Option<Arrived>, String> {
     let mut header = [0_u8; HEADER_LEN];
     match stream.read(&mut header) {
         Ok(0) => return Ok(None),
@@ -273,13 +321,23 @@ fn read_request(stream: &mut TcpStream) -> Result<Option<(u8, Vec<u8>)>, String>
     }
     let mut len = [0_u8; 4];
     len.copy_from_slice(&header[6..10]);
-    let mut payload = vec![0_u8; u32::from_be_bytes(len) as usize];
+    let len = u32::from_be_bytes(len);
+    if header_only {
+        return Ok(Some((header[5], Vec::new(), Some(len))));
+    }
+    let mut payload = vec![0_u8; len as usize];
     fill(stream, &mut payload)?;
-    Ok(Some((header[5], payload)))
+    Ok(Some((header[5], payload, None)))
 }
 
 /// Play one reply. `false` means the connection is finished.
 fn play(stream: &mut TcpStream, steps: &[Step], transcript: &mut Transcript) -> bool {
+    play_streamed(stream, steps, transcript, None)
+}
+
+/// [`play`], with `unread` bytes of the request's payload still on the socket for a
+/// [`Step::ReadPayload`] to take.
+fn play_streamed(stream: &mut TcpStream, steps: &[Step], transcript: &mut Transcript, mut unread: Option<u32>) -> bool {
     for step in steps {
         let bytes = match step {
             Step::Log(text) => frame(Status::Log.wire_byte(), text.as_bytes()),
@@ -308,6 +366,32 @@ fn play(stream: &mut TcpStream, steps: &[Step], transcript: &mut Transcript) -> 
             Step::Raw(bytes) => bytes.clone(),
             Step::Pause(how_long) => {
                 std::thread::sleep(*how_long);
+                continue;
+            }
+            Step::ReadPayload => {
+                let Some(len) = unread.take() else {
+                    transcript
+                        .trouble
+                        .push("a ReadPayload step with no payload left to read".to_owned());
+                    return false;
+                };
+                let mut payload = vec![0_u8; len as usize];
+                if let Err(trouble) = fill(stream, &mut payload) {
+                    transcript.trouble.push(trouble);
+                    return false;
+                }
+                if let Some((_, taken)) = transcript.requests.last_mut() {
+                    *taken = payload;
+                }
+                continue;
+            }
+            Step::Wait(gate) => {
+                if !gate.wait(PATIENCE) {
+                    transcript
+                        .trouble
+                        .push(format!("the test did not open the gate within {PATIENCE:?}"));
+                    return false;
+                }
                 continue;
             }
             Step::Close => return false,
