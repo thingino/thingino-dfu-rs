@@ -44,7 +44,7 @@ pub mod mock;
 // The `nusb` backend, on every target that is not the browser. Target-gated rather than
 // feature-gated so `tdfu-wasm` cannot acquire it through `--all-features`; the module's
 // own docs carry the rest.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(not(any(target_family = "wasm", target_os = "espidf")))]
 pub mod native;
 
 pub use error::{Pipe, UsbError, UsbErrorKind};

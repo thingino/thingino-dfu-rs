@@ -29,7 +29,9 @@ thiserror.workspace = true
 # multiple of the endpoint's max packet size, awaiting a `Blocking` MaybeFuture panics
 # without the `smol`/`tokio` feature, and `transfer_blocking`'s post-cancel wait is
 # unbounded. Bumping it is a reviewed change, not a lockfile refresh.
-[target.'cfg(not(target_family = "wasm"))'.dependencies]
+# ESP-IDF (the backpack firmware) brings its own USB host backend, and nusb has no
+# platform layer for it.
+[target.'cfg(not(any(target_family = "wasm", target_os = "espidf")))'.dependencies]
 nusb = "=0.2.7"
 
 [lints]
