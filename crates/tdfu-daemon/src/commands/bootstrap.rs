@@ -20,7 +20,9 @@
 //! port. A `--cpu` the caller supplied is a claim, not a detection, and feeding it back
 //! through `DISCOVER` would republish the caller's guess as this daemon's finding —
 //! which is exactly the shape the device list removes from the C. Only a
-//! [`Detection::Resolved`] is remembered.
+//! [`Detection::Resolved`] is remembered. A bootstrap with the client's loader pair
+//! detects nothing itself, so its gadget reports what `DISCOVER` detected on the same
+//! device, if anything; a daemon that stores no loaders is sent a pair every time.
 //!
 //! # A loader pair can stream
 //!
@@ -245,6 +247,8 @@ fn finish<B, C, T>(
             if let Some(variant) = detected {
                 state.variants.put(&opened.port, opened.identity, true, variant);
                 tracing::debug!(?variant, port = %opened.port.describe(), "remembered the detected SoC for this port");
+            } else if state.variants.expect_gadget(&opened.port, opened.identity) {
+                tracing::debug!(port = %opened.port.describe(), "kept DISCOVER's detection of this device for its gadget");
             }
             Reply::ok()
         }
@@ -478,7 +482,7 @@ mod tests {
     use crate::commands::state::{Activity, DaemonState, Identity, Port};
     use tdfu_core::clock::RecordingClock;
     use tdfu_core::model::Variant;
-    use tdfu_proto::{Blobs, Command, Request, Status};
+    use tdfu_proto::{Blobs, Command, DeviceEntry, Request, Status, WireVariant};
     use tdfu_usb::mock::block_on;
 
     fn daemon(backend: FakeBackend, root: &std::path::Path) -> DaemonState<FakeBackend, RecordingClock> {
@@ -660,6 +664,70 @@ mod tests {
             "the silicon's answer, not the caller's t23x"
         );
         Ok(())
+    }
+
+    /// **A bootstrap with the client's loader pair keeps the detection `DISCOVER` made.**
+    /// The pair path detects nothing, and a daemon that stores no loaders is sent a pair
+    /// every time, so before this its gadgets always listed as unknown. The entry is this
+    /// device's own measurement, so no claim is republished.
+    #[test]
+    fn a_pair_bootstrap_keeps_the_detection_discover_made() -> TestResult {
+        let backend = FakeBackend::new(vec![FakeBackend::detected_then_bootstrappable_bootrom(
+            t23_regs(),
+            b"stage-1".to_vec(),
+            b"u-boot".to_vec(),
+        )]);
+        let mut state = daemon(backend, std::path::Path::new("/nonexistent-firmware-dir"));
+        let gadget = pair_bootstrap_then_the_gadget(&mut state)?;
+        assert_eq!(gadget.stage, 2, "a gadget is stage 2");
+        assert_eq!(
+            gadget.variant.name(),
+            Some("t23n"),
+            "and it reports what DISCOVER detected"
+        );
+        Ok(())
+    }
+
+    /// ... and when `DISCOVER` could not name the chip there is nothing to keep.
+    #[test]
+    fn a_pair_bootstrap_after_no_detection_leaves_the_gadget_unknown() -> TestResult {
+        let backend = FakeBackend::new(vec![FakeBackend::detected_then_bootstrappable_bootrom(
+            [0x1FFF_F000, 0, 0],
+            b"stage-1".to_vec(),
+            b"u-boot".to_vec(),
+        )]);
+        let mut state = daemon(backend, std::path::Path::new("/nonexistent-firmware-dir"));
+        let gadget = pair_bootstrap_then_the_gadget(&mut state)?;
+        assert_eq!(gadget.variant, WireVariant::UNKNOWN);
+        Ok(())
+    }
+
+    /// `DISCOVER`, a `BOOTSTRAP` with the client's pair, the gadget taking the bootrom's
+    /// port, and the gadget's row in the `DISCOVER` after that.
+    fn pair_bootstrap_then_the_gadget(
+        state: &mut DaemonState<FakeBackend, RecordingClock>,
+    ) -> Result<DeviceEntry, Box<dyn std::error::Error>> {
+        let mut listing = LoopbackConn::raw();
+        block_on(dispatch(&mut listing, state, Command::Discover, &[]))?;
+        let payload = Request::Bootstrap {
+            index: 0,
+            variant: Vec::new(),
+            blobs: Some(Blobs {
+                spl: b"stage-1".to_vec(),
+                uboot: b"u-boot".to_vec(),
+            }),
+        }
+        .encode()?;
+        let mut conn = LoopbackConn::raw();
+        block_on(dispatch(&mut conn, state, Command::Bootstrap, &payload))?;
+        assert_eq!(conn.response(), Some((Status::Ok, b"OK".to_vec())));
+
+        state.backend.replace_with_gadget_on_the_same_port(0);
+        let mut after = LoopbackConn::raw();
+        block_on(dispatch(&mut after, state, Command::Discover, &[]))?;
+        let (_, rows) = after.response().ok_or("DISCOVER answered nothing")?;
+        let gadget = DeviceEntry::decode_list(&rows)?.into_iter().next().ok_or("no row")?;
+        Ok(gadget)
     }
 
     /// **A caller's variant from another family is refused, and nothing is uploaded.**

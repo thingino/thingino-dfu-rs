@@ -909,6 +909,25 @@ impl FakeBackend {
         }
     }
 
+    /// A bootrom that answers `DISCOVER`'s detection on its first open and a bootstrap
+    /// with the client's loader pair, which detects nothing, on its second: what a daemon
+    /// that stores no loaders sees on every bootstrap.
+    #[must_use]
+    pub fn detected_then_bootstrappable_bootrom(regs: [u32; 3], stage1: Vec<u8>, uboot: Vec<u8>) -> FakeDevice {
+        let opened = Cell::new(0_u32);
+        FakeDevice {
+            descriptors: bootrom_descriptors(1, 7, vec![4, 2]),
+            opens: Opens::Script(Box::new(move |descriptors| {
+                opened.set(opened.get() + 1);
+                if opened.get() == 1 {
+                    detect_script(descriptors.clone(), regs)
+                } else {
+                    bootstrap_script(descriptors.clone(), &stage1, &uboot, bootrom::BULK_CHUNK)
+                }
+            })),
+        }
+    }
+
     /// A U-Boot DFU gadget backed by the emulator, on the default port `[4, 3]`.
     #[must_use]
     pub fn gadget() -> FakeDevice {

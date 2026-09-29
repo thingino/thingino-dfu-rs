@@ -377,6 +377,28 @@ impl VariantCache {
         });
     }
 
+    /// Expect the gadget a bootstrap is turning this device into, when a detection of this
+    /// very device is remembered; `false` when none is.
+    ///
+    /// A bootstrap with the client's loader pair runs no detection of its own, but the
+    /// `DISCOVER` that listed the device did. An entry whose identity is still this
+    /// device's is that measurement and not the client's claim, so it may follow the
+    /// device through the re-enumeration exactly as [`put`](Self::put)'s `expect_gadget`
+    /// would have let it.
+    pub fn expect_gadget(&mut self, port: &Port, identity: Identity) -> bool {
+        let used = self.next_tick();
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.port == *port && entry.identity == identity)
+        else {
+            return false;
+        };
+        entry.expect_gadget = true;
+        entry.used = used;
+        true
+    }
+
     /// What was detected on the device that is `identity` at `port`.
     ///
     /// A different identity at the same port is a different device, and the answer is
@@ -851,6 +873,25 @@ mod tests {
         // And a bootstrap's expectation does not excuse something that is not a gadget.
         cache.put(&port(1, &[4, 2]), ident(7), true, Variant::T23n);
         assert_eq!(cache.get(&port(1, &[4, 2]), ident(11), false), None);
+    }
+
+    /// **An earlier detection of the same device may follow it to its gadget.** A
+    /// bootstrap with the client's loader pair detects nothing itself, so `DISCOVER`'s
+    /// entry is carried over, and only for the device it was measured on.
+    #[test]
+    fn a_detection_of_the_same_device_is_carried_to_its_gadget() {
+        let mut cache = VariantCache::new();
+        cache.put(&port(1, &[4, 2]), ident(7), false, Variant::T23n);
+        assert!(
+            !cache.expect_gadget(&port(1, &[4, 2]), ident(6)),
+            "another device number is another device"
+        );
+        assert!(
+            !cache.expect_gadget(&port(1, &[4, 3]), ident(7)),
+            "and another port another place"
+        );
+        assert!(cache.expect_gadget(&port(1, &[4, 2]), ident(7)));
+        assert_eq!(cache.get(&port(1, &[4, 2]), ident(11), true), Some(Variant::T23n));
     }
 
     /// A device with no followable port is not remembered: there is nothing to correlate
