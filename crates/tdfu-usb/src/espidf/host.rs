@@ -22,9 +22,9 @@ use crate::{DeviceDescriptors, Discovered, LocalUsbBackend, Pipe, UsbError};
 /// How many device addresses one listing reads. There is one root port and no hub
 /// support, so one is the most there can be.
 const ADDRESS_SLOTS: usize = 16;
-/// The ESP32-S3's host port control and status register (HPRT): the USB OTG controller is
-/// at `0x6008_0000` (`esp32s3.peripherals.ld`) and HPRT at `0x440` in it (`usb_dwc_struct.h`).
-const HPRT: usize = 0x6008_0440;
+/// The host port control and status register (HPRT) sits at `0x440` in the USB controller
+/// (`usb_dwc_struct.h`).
+const HPRT_OFFSET: usize = 0x440;
 const HPRT_ATTACHED: u32 = 1 << 0;
 const HPRT_POWERED: u32 = 1 << 12;
 /// How long a device may sit attached to a powered port with nothing enumerated before its
@@ -262,11 +262,11 @@ impl UsbHost {
                 unsafe { sys::usb_host_client_handle_events(client.0, u32::MAX) };
             }
         })?;
-        if is_esp32s3() {
+        if let Some(hprt) = hprt_address() {
             let watched = Arc::clone(&shared);
-            spawn("usb-watch", move || retry_abandoned_enumerations(&watched))?;
+            spawn("usb-watch", move || retry_abandoned_enumerations(&watched, hprt))?;
         } else {
-            tracing::warn!("usb: not an ESP32-S3, so abandoned enumerations are not retried");
+            tracing::warn!("usb: no known port register on this chip, so abandoned enumerations are not retried");
         }
         Ok(Self { shared })
     }
@@ -301,9 +301,16 @@ impl UsbHost {
     }
 }
 
-/// The watcher reads a register at the ESP32-S3's address, the one chip it has run on.
-fn is_esp32s3() -> bool {
-    sys::CONFIG_IDF_TARGET.as_slice() == b"esp32s3\0"
+/// HPRT of the controller the library drives, from `<chip>.peripherals.ld`: the S2's and
+/// S3's one full-speed controller, and on the P4 the high-speed one, which the library takes
+/// when `peripheral_map` is left at 0.
+fn hprt_address() -> Option<usize> {
+    let base = match sys::CONFIG_IDF_TARGET.as_slice() {
+        b"esp32s2\0" | b"esp32s3\0" => 0x6008_0000,
+        b"esp32p4\0" => 0x5000_0000,
+        _ => return None,
+    };
+    Some(base + HPRT_OFFSET)
 }
 
 /// When an enumeration stage fails (`CHECK_ADDR`, or `CHECK_SHORT_DEV_DESC` while a camera
@@ -312,14 +319,14 @@ fn is_esp32s3() -> bool {
 /// is listed and nothing looks at the port again until the device is unplugged. A device
 /// attached to a powered port with nothing enumerated is power-cycled, which enumerates it
 /// afresh.
-fn retry_abandoned_enumerations(shared: &Shared) {
-    let hprt = ptr::with_exposed_provenance::<u32>(HPRT);
+fn retry_abandoned_enumerations(shared: &Shared, hprt: usize) {
+    let hprt = ptr::with_exposed_provenance::<u32>(hprt);
     let mut since: Option<Instant> = None;
     let mut empty_since: Option<Instant> = None;
     let mut wait = ABANDONED_AFTER;
     loop {
         thread::sleep(WATCH_EVERY);
-        // SAFETY: HPRT is a status register of the S3's USB controller, which the library
+        // SAFETY: HPRT is a status register of the USB controller the library runs, which it
         // has clocked since `install`; reading it has no side effects.
         let port = unsafe { ptr::read_volatile(hprt) };
         let listed = !addresses().is_empty();

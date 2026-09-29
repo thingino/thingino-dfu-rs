@@ -1,5 +1,6 @@
-//! A backend on the ESP-IDF USB Host Library, for an ESP32-S3 whose OTG port is the
-//! camera's USB host (the thingino dev backpack).
+//! A backend on the ESP-IDF USB Host Library, for an ESP32-S2, -S3 or -P4 whose OTG port is
+//! the camera's USB host (the thingino dev backpack). Run on the S3; the S2 and the P4's
+//! high-speed port are untested.
 //!
 //! The library leaves four things to its caller, and this backend does them:
 //!
