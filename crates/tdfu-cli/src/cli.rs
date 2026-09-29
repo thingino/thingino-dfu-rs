@@ -162,9 +162,16 @@ pub struct Cli {
     #[arg(long = "size", value_name = "BYTES", value_parser = parse_size, allow_negative_numbers = true, action = ArgAction::Set, overrides_with = "size")]
     pub size: Option<u64>,
 
-    /// Operate through a `dfu-remote` daemon at this address.
-    #[arg(long = "host", value_name = "ADDR", action = ArgAction::Set, overrides_with = "host")]
-    pub host: Option<String>,
+    /// Operate through a `dfu-remote` daemon at this address: a name or an IP, with or
+    /// without `:PORT`. An IPv6 address takes a port only in brackets, `[2001:db8::1]:5050`.
+    #[arg(
+        long = "host",
+        value_name = "ADDR",
+        value_parser = parse_host,
+        action = ArgAction::Set,
+        overrides_with = "host"
+    )]
+    pub host: Option<HostArg>,
 
     /// Port of the remote daemon (default 5050).
     //
@@ -304,6 +311,64 @@ fn parse_port(raw: &str) -> Result<u16, String> {
     Ok(port)
 }
 
+/// `--host` split into the host to resolve and the port it named, if it named one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostArg {
+    /// A name, an IPv4 address, or an IPv6 address without its brackets.
+    pub host: String,
+    /// The port after the host, when there was one.
+    pub port: Option<u16>,
+}
+
+/// `--host`: `NAME`, `NAME:PORT`, `IPV4`, `IPV4:PORT`, a bare IPv6 address, or one in
+/// brackets with or without `:PORT`.
+///
+/// A bare IPv6 address never carries a port, because its last group would be read as
+/// one: more than one colon outside brackets is the whole address. Brackets are taken
+/// off, since a resolver given `[2001:db8::1]` looks for a host by that name.
+fn parse_host(raw: &str) -> Result<HostArg, String> {
+    let (host, port) = if let Some(rest) = raw.strip_prefix('[') {
+        let (inside, after) = rest
+            .split_once(']')
+            .ok_or_else(|| format!("--host `{raw}` opens a bracket it never closes"))?;
+        let port = if after.is_empty() {
+            None
+        } else {
+            let port = after
+                .strip_prefix(':')
+                .ok_or_else(|| format!("--host `{raw}` has `{after}` after the address; a port is written `]:PORT`"))?;
+            Some(host_port(port, raw)?)
+        };
+        (inside, port)
+    } else {
+        match raw.split_once(':') {
+            Some((host, port)) if !port.contains(':') => (host, Some(host_port(port, raw)?)),
+            _ => (raw, None),
+        }
+    };
+    if host.is_empty() {
+        return Err(format!("--host `{raw}` names no host"));
+    }
+    Ok(HostArg {
+        host: host.to_owned(),
+        port,
+    })
+}
+
+/// The port after a `--host`, with the whole argument in the message.
+fn host_port(port: &str, raw: &str) -> Result<u16, String> {
+    match port.parse::<u16>() {
+        Ok(0) => Err(format!(
+            "--host `{raw}` names port 0, which asks the OS to choose; name the daemon's port"
+        )),
+        Ok(port) => Ok(port),
+        Err(_) => Err(format!(
+            "--host `{raw}` ends in `:{port}`, which is not a port in 1-{}",
+            u16::MAX
+        )),
+    }
+}
+
 impl Cli {
     /// Turn the flags into the ordered [`Plan`] the run will follow.
     ///
@@ -329,7 +394,7 @@ impl Cli {
 
     /// `--host`/`--port`/`--token`, and the rule that they go together.
     fn remote(&self) -> Result<Option<Remote>, PlanError> {
-        let Some(host) = self.host.clone() else {
+        let Some(HostArg { host, port: in_host }) = self.host.clone() else {
             // Silently ignoring a `--port` that cannot do anything is the worst shape a
             // defect can take: an omission leaves nothing to grep for, and the
             // user believes they configured something. The C ignores both
@@ -350,11 +415,16 @@ impl Cli {
         // daemon's own loaders were uploaded while the operator believed they had chosen
         // others; a daemon that has a tree refuses it at the bootstrap instead, which is
         // the first moment this client can know which kind it is talking to.
-        Ok(Some(Remote {
-            host,
+        let port = match (in_host, self.port) {
+            (Some(host), Some(flag)) if host != flag => return Err(PlanError::TwoPorts { host, flag }),
+            (Some(port), _) | (None, Some(port)) => port,
             // The default is resolved here rather than by clap, so that "given" is still
             // knowable above.
-            port: self.port.unwrap_or(DEFAULT_PORT),
+            (None, None) => DEFAULT_PORT,
+        };
+        Ok(Some(Remote {
+            host,
+            port,
             token: self.token.clone(),
         }))
     }
@@ -869,6 +939,68 @@ mod tests {
             parse(&["-l", "--host", "cam"])?.into_plan()?.remote.map(|r| r.port),
             Some(DEFAULT_PORT)
         );
+        Ok(())
+    }
+
+    /// `--host` takes a name or an address, with or without a port, and an IPv6 address
+    /// bare or in brackets: the brackets are what let an IPv6 address carry a port.
+    #[test]
+    fn a_host_is_a_name_or_an_address_with_or_without_a_port() -> TestResult {
+        let at = |args: &[&str]| -> Result<(String, u16), Box<dyn std::error::Error>> {
+            let remote = parse(args)?.into_plan()?.remote.ok_or("no remote")?;
+            Ok((remote.host, remote.port))
+        };
+        for (given, host, port) in [
+            ("cam", "cam", DEFAULT_PORT),
+            ("cam:5051", "cam", 5051),
+            ("192.0.2.10", "192.0.2.10", DEFAULT_PORT),
+            ("192.0.2.10:5051", "192.0.2.10", 5051),
+            ("2001:db8::1", "2001:db8::1", DEFAULT_PORT),
+            ("[2001:db8::1]", "2001:db8::1", DEFAULT_PORT),
+            ("[2001:db8::1]:5051", "2001:db8::1", 5051),
+            ("[fe80::1%eth0]:5051", "fe80::1%eth0", 5051),
+            // A bare IPv6 address never carries a port: its last group is part of it.
+            ("2001:db8::1:5051", "2001:db8::1:5051", DEFAULT_PORT),
+        ] {
+            assert_eq!(at(&["-l", "--host", given])?, (host.to_owned(), port), "--host {given}");
+        }
+        Ok(())
+    }
+
+    /// What `--host` cannot mean is refused while parsing, with the argument quoted.
+    #[test]
+    fn a_host_that_cannot_be_read_is_refused() {
+        for (given, says) in [
+            ("[2001:db8::1", "opens a bracket it never closes"),
+            ("[2001:db8::1]5051", "a port is written `]:PORT`"),
+            ("[]", "names no host"),
+            (":5051", "names no host"),
+            ("cam:", "which is not a port"),
+            ("cam:http", "which is not a port"),
+            ("cam:70000", "which is not a port"),
+            ("[2001:db8::1]:0", "names port 0"),
+        ] {
+            let message = refusal(&["-l", "--host", given]);
+            assert!(message.contains(says), "--host {given}: {message}");
+        }
+    }
+
+    /// A port after the host and a `--port` that disagrees with it are refused; the same
+    /// port given twice is only said twice.
+    #[test]
+    fn two_different_ports_are_refused() -> TestResult {
+        assert_eq!(
+            parse(&["-l", "--host", "cam:5051", "--port", "5052"])?.into_plan(),
+            Err(PlanError::TwoPorts { host: 5051, flag: 5052 })
+        );
+        let port = |args: &[&str]| -> Result<Option<u16>, Box<dyn std::error::Error>> {
+            Ok(parse(args)?.into_plan()?.remote.map(|remote| remote.port))
+        };
+        assert_eq!(
+            port(&["-l", "--host", "[2001:db8::1]:5051", "--port", "5051"])?,
+            Some(5051)
+        );
+        assert_eq!(port(&["-l", "--host", "[2001:db8::1]", "--port", "5052"])?, Some(5052));
         Ok(())
     }
 

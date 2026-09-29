@@ -113,6 +113,10 @@ dfu-remote --port 5050 --token secret          # on the machine with the camera
 thingino-dfu --host camera-host:5050 -w image.bin --verify
 ```
 
+`--host` takes a name or an address, with or without `:PORT`. An IPv6 address works bare
+(`--host 2001:db8::1`) or in brackets, and takes a port only in brackets:
+`--host '[2001:db8::1]:5050'`, quoted so the shell does not read the brackets as a pattern.
+
 `dfu-remote` listens on every interface unless `--bind` names one, and `-d` turns on
 debug output. On the client, `-d` with `--host` also asks the daemon for its protocol
 narration, so a remote run reads as a local one; a daemon too old to send it says so

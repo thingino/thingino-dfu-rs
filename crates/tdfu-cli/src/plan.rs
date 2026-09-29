@@ -307,6 +307,15 @@ pub enum PlanError {
         option: &'static str,
     },
 
+    /// `--host ADDR:PORT` and a `--port` that disagrees with it.
+    #[error("--host names port {host} and --port names {flag}; give the port once")]
+    TwoPorts {
+        /// The port after the host.
+        host: u16,
+        /// The one `--port` gave.
+        flag: u16,
+    },
+
     /// `--cpu`, `--spl`, `--uboot` or `--firmware-dir` with nothing to bootstrap.
     #[error(
         "{option} chooses the loaders a bootstrap uploads; nothing in this command bootstraps. \
