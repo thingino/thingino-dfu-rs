@@ -132,6 +132,11 @@ pub struct LoopbackConn {
     left_at: RefCell<Vec<u64>>,
     /// A reply opened by `begin_reply`: its status, announced length, and bytes so far.
     reply: RefCell<Option<(Status, u64, Vec<u8>)>>,
+    /// How far this connection's clock has moved from where it started. It moves only
+    /// when a test moves it, so which byte counts the pump's cap lets through is decided
+    /// by the test and not by how fast the machine runs it.
+    elapsed: Rc<Cell<Duration>>,
+    started: std::time::Instant,
 }
 
 impl LoopbackConn {
@@ -152,7 +157,16 @@ impl LoopbackConn {
             drained: Cell::new(0),
             left_at: RefCell::new(Vec::new()),
             reply: RefCell::new(None),
+            elapsed: Rc::new(Cell::new(Duration::ZERO)),
+            started: std::time::Instant::now(),
         }
+    }
+
+    /// A handle on this connection's clock that outlives the mutable borrow `dispatch`
+    /// takes: add to it to let time pass.
+    #[must_use]
+    pub fn clock(&self) -> Rc<Cell<Duration>> {
+        Rc::clone(&self.elapsed)
     }
 
     /// A streamed request's payload, as `Conn::next_incoming` leaves it on the socket.
@@ -469,6 +483,10 @@ impl Wire for LoopbackConn {
         }
         self.sent.borrow_mut().push(Sent::Response(status, body));
         Ok(())
+    }
+
+    fn now(&self) -> std::time::Instant {
+        self.started + self.elapsed.get()
     }
 }
 

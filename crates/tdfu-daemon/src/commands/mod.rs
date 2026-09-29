@@ -114,6 +114,12 @@ pub trait Wire {
     /// # Errors
     /// [`DaemonError`] short of the announced length, or when the connection failed.
     async fn end_reply(&mut self) -> Result<(), DaemonError>;
+
+    /// The time the pace of progress frames is measured in
+    /// ([`report::pump`]'s cap on byte counts). A test double holds it still.
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
 }
 
 /// What a handler decided, before it reaches the wire.

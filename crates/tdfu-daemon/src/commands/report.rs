@@ -6,7 +6,7 @@
 //! one** (`cli/remote.c:186`, `:237`, `:300`; `web/src/remote.js:25`, `:148`). An earlier
 //! implementation inherited the omission, so remote flashing showed progress only as log
 //! prose: an omission, the kind of defect with nothing to grep for.
-//! **This daemon sends one per byte count**, and this is where.
+//! **This daemon sends byte counts as frames**, about ten a second, and this is where.
 //!
 //! # The problem this file exists to solve
 //!
@@ -34,6 +34,7 @@ use core::cell::Cell;
 use core::future::{Future, poll_fn};
 use core::pin::pin;
 use core::task::Poll;
+use core::time::Duration;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io;
@@ -296,18 +297,34 @@ const INTAKE_BYTES_STEPS: u64 = 100;
 /// ... and never more often than this many bytes apart.
 const INTAKE_BYTES_FLOOR: u64 = 64 * 1024;
 
-/// What goes out while a streamed request is still arriving: little.
+/// The most often a byte count goes out: ten a second, all a bar needs. Over an ESP32's
+/// Wi-Fi every frame costs a millisecond or two, and an upload counts each 4 KiB block,
+/// so sending them all spent six seconds of a 16 MiB read on reporting it.
+const COUNT_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How often, and how much, [`pump_with`] sends.
 ///
-/// A client may read nothing until it has sent its whole request; a browser's `fetch`
-/// does not look at the response before the body is up. Every frame sent meanwhile waits
-/// in the client's receive buffer, and once that is full the daemon's writes block, so
-/// it stops reading the payload, so the client's writes block too, and neither side
-/// moves again. So while the payload is still coming, byte counts are thinned to about
-/// [`INTAKE_BYTES_STEPS`] per phase and everything together stays under
+/// **Byte counts are capped at one per [`COUNT_INTERVAL`].** One that comes sooner is
+/// held, a later one replaces it, and the held count goes out ahead of the next phase or
+/// log line and when the operation ends, so a bar still finishes at its last count before
+/// the phase or the note that follows it. Not ahead of narration, which core emits along
+/// the way whether or not anyone reads it: releasing on that would send every count.
+///
+/// **What goes out while a streamed request is still arriving is also small.** A client
+/// may read nothing until it has sent its whole request; a browser's `fetch` does not
+/// look at the response before the body is up. Every frame sent meanwhile waits in the
+/// client's receive buffer, and once that is full the daemon's writes block, so it stops
+/// reading the payload, so the client's writes block too, and neither side moves again.
+/// So while the payload is still coming, byte counts are also thinned to about
+/// [`INTAKE_BYTES_STEPS`] per phase, and everything together stays under
 /// [`INTAKE_FRAME_BUDGET`], far below any receive window. Narration past the budget is
 /// counted rather than sent, and the count goes out once the payload is in.
 #[derive(Debug, Default)]
-struct Thinning {
+struct Pacing {
+    /// When the last byte count went out.
+    counted_at: Option<std::time::Instant>,
+    /// The latest byte count not yet sent.
+    held: Option<Progress>,
     /// Frame bytes sent while the payload was arriving.
     spent: usize,
     /// The stage and byte count of the last byte-count frame sent meanwhile.
@@ -316,8 +333,38 @@ struct Thinning {
     held_back: usize,
 }
 
-impl Thinning {
-    async fn offer<W: Wire>(&mut self, conn: &mut W, progress: &Progress) -> Result<(), DaemonError> {
+impl Pacing {
+    async fn offer<W: Wire>(&mut self, conn: &mut W, progress: Progress) -> Result<(), DaemonError> {
+        match progress {
+            Progress::Bytes { .. } => {
+                let now = conn.now();
+                if self
+                    .counted_at
+                    .is_some_and(|at| now.saturating_duration_since(at) < COUNT_INTERVAL)
+                {
+                    self.held = Some(progress);
+                    return Ok(());
+                }
+                self.held = None;
+                self.counted_at = Some(now);
+            }
+            Progress::Debug(_) => {}
+            _ => self.release(conn).await?,
+        }
+        self.deliver(conn, &progress).await
+    }
+
+    /// Send the byte count being held, if there is one.
+    async fn release<W: Wire>(&mut self, conn: &mut W) -> Result<(), DaemonError> {
+        if let Some(count) = self.held.take() {
+            self.counted_at = Some(conn.now());
+            self.deliver(conn, &count).await?;
+        }
+        Ok(())
+    }
+
+    /// One frame, under the rules for a request still arriving.
+    async fn deliver<W: Wire>(&mut self, conn: &mut W, progress: &Progress) -> Result<(), DaemonError> {
         if conn.payload_left() == 0 {
             self.settle(conn).await?;
             return send(conn, progress).await;
@@ -411,7 +458,7 @@ enum Step<T> {
 
 /// [`pump`], for an operation that also reads a streamed payload or writes a streamed
 /// reply through `io`. The pump reads and writes for it between polls, and while the
-/// payload is still arriving it sends little ([`Thinning`]).
+/// payload is still arriving it sends little ([`Pacing`]).
 ///
 /// # Errors
 /// As [`pump`], and a failure to read the payload or write the reply ends it the same
@@ -428,7 +475,7 @@ pub async fn pump_with<W: Wire, T>(
     // itself keeps the attach rule for the log and progress frames (`Conn::log`,
     // `Conn::progress`).
     let attached = conn.logs_enabled_for(cmd) || conn.narrates();
-    let mut thinning = Thinning::default();
+    let mut pacing = Pacing::default();
     loop {
         // One step: the future finished, or there is progress to flush, or the future
         // waits on its streams. It answers `Pending` only when the future is pending
@@ -459,7 +506,7 @@ pub async fn pump_with<W: Wire, T>(
         while let Some(progress) = queue.pop() {
             drained += 1;
             if attached {
-                thinning.offer(conn, &progress).await?;
+                pacing.offer(conn, progress).await?;
             }
         }
 
@@ -468,7 +515,8 @@ pub async fn pump_with<W: Wire, T>(
                 // The last of a streamed reply, if the operation wrote one.
                 io.serve(conn).await?;
                 if attached {
-                    thinning.settle(conn).await?;
+                    pacing.release(conn).await?;
+                    pacing.settle(conn).await?;
                 }
                 return Ok(value);
             }
@@ -574,7 +622,7 @@ async fn send<W: Wire>(conn: &mut W, progress: &Progress) -> Result<(), DaemonEr
 
 #[cfg(test)]
 mod tests {
-    use super::{INTAKE_BYTES_STEPS, INTAKE_FRAME_BUDGET, Intake, Io, Outbox, Queue, pump, pump_with};
+    use super::{COUNT_INTERVAL, INTAKE_BYTES_STEPS, INTAKE_FRAME_BUDGET, Intake, Io, Outbox, Queue, pump, pump_with};
     use crate::commands::Wire;
     use crate::commands::fake::{LoopbackConn, Sent};
     use tdfu_core::progress::{Phase, Progress};
@@ -853,11 +901,14 @@ mod tests {
     fn progress_is_flushed_between_polls_not_at_the_end() -> TestResult {
         let mut conn = LoopbackConn::raw().during(Command::Write);
         let transcript = conn.transcript();
+        let clock = conn.clock();
         let queue = Queue::new();
         let mut sink = queue.sink();
         let seen = std::cell::RefCell::new(Vec::new());
         block_on(pump(&mut conn, Command::Write, &queue, async {
             for done in 1..=3_u64 {
+                // A whole interval apart, so the cap lets each one through.
+                clock.set(clock.get() + COUNT_INTERVAL);
                 sink(Progress::Bytes {
                     phase: Phase::Download,
                     done,
@@ -1021,6 +1072,9 @@ mod tests {
         let payload: Vec<u8> = (0..=250_u8).cycle().take(LEN).collect();
         let mut conn = LoopbackConn::raw().narrating().during(Command::Write);
         conn.feed(&payload);
+        // A whole interval per block, so what thins the counts here is the intake's rule
+        // and not the cap on counts.
+        let clock = conn.clock();
         let queue = Queue::new();
         let intake = Intake::new();
         let got = std::cell::RefCell::new(Vec::new());
@@ -1035,6 +1089,7 @@ mod tests {
             sink(Progress::Phase(Phase::Download));
             for done in (BLOCK..=LEN).step_by(BLOCK) {
                 source.read_exact(&mut block).await?;
+                clock.set(clock.get() + COUNT_INTERVAL);
                 got.borrow_mut().extend_from_slice(&block);
                 sink(Progress::Debug(format!(
                     "download: block at {done:>8} went out, {}",
@@ -1100,10 +1155,12 @@ mod tests {
     #[test]
     fn a_whole_request_is_not_thinned() -> TestResult {
         let mut conn = LoopbackConn::raw().during(Command::Write);
+        let clock = conn.clock();
         let queue = Queue::new();
         let mut sink = queue.sink();
         block_on(pump_with(&mut conn, Command::Write, &queue, Io::NONE, async {
             for done in 1..=500_u64 {
+                clock.set(clock.get() + COUNT_INTERVAL);
                 sink(Progress::Bytes {
                     phase: Phase::Download,
                     done,
@@ -1180,6 +1237,118 @@ mod tests {
         }))??;
         block_on(conn.end_reply())?;
         assert_eq!(conn.response(), Some((Status::Ok, body)));
+        Ok(())
+    }
+
+    // ------------------------------------------------------------ the cap on counts
+
+    fn count(done: u64) -> Progress {
+        Progress::Bytes {
+            phase: Phase::Upload,
+            done,
+            total: None,
+        }
+    }
+
+    fn counts_sent(sent: &[Sent]) -> Vec<String> {
+        sent.iter()
+            .filter_map(|frame| match frame {
+                Sent::Progress(body) => Some(body.message.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// **Byte counts go out ten a second**, however fast they come, and the last one
+    /// still goes out: a 10 s operation counting every 10 ms sends 100 counts plus its
+    /// final one, not 1000. Each frame costs a millisecond or two over an ESP32's Wi-Fi.
+    #[test]
+    fn byte_counts_go_out_ten_a_second() -> TestResult {
+        let mut conn = LoopbackConn::raw().during(Command::Read);
+        let clock = conn.clock();
+        let queue = Queue::new();
+        let mut sink = queue.sink();
+        block_on(pump(&mut conn, Command::Read, &queue, async {
+            for block in 0..1000_u64 {
+                sink(count(block));
+                yield_once().await;
+                clock.set(clock.get() + COUNT_INTERVAL / 10);
+            }
+        }))?;
+        let counts = counts_sent(&conn.sent());
+        assert_eq!(counts.len(), 101, "{counts:?}");
+        assert_eq!(counts.first().map(String::as_str), Some("0 bytes"));
+        assert_eq!(
+            counts.get(1).map(String::as_str),
+            Some("10 bytes"),
+            "the next whole interval"
+        );
+        assert_eq!(
+            counts.last().map(String::as_str),
+            Some("999 bytes"),
+            "and the last count"
+        );
+        Ok(())
+    }
+
+    /// A held count goes out ahead of a log line, so a bar reaches its last count before
+    /// the note that ends it, and when the operation ends.
+    #[test]
+    fn a_held_count_goes_out_before_a_note_and_at_the_end() -> TestResult {
+        let mut conn = LoopbackConn::raw().during(Command::Read);
+        let queue = Queue::new();
+        let mut sink = queue.sink();
+        block_on(pump(&mut conn, Command::Read, &queue, async {
+            sink(count(1));
+            yield_once().await;
+            sink(count(2));
+            yield_once().await;
+            sink(Progress::Note("between".to_owned()));
+            yield_once().await;
+            sink(count(3));
+            yield_once().await;
+            sink(count(4));
+        }))?;
+        let order: Vec<String> = conn
+            .sent()
+            .iter()
+            .map(|frame| match frame {
+                Sent::Progress(body) => body.message.clone(),
+                Sent::Log(line) => line.trim_end().to_owned(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(order, ["1 bytes", "2 bytes", "between", "4 bytes"]);
+        Ok(())
+    }
+
+    /// Narration does not release a held count: core narrates along the way whether or
+    /// not anyone reads it, and releasing on it would send every count.
+    #[test]
+    fn narration_does_not_release_a_held_count() -> TestResult {
+        let mut conn = LoopbackConn::raw().narrating().during(Command::Read);
+        let clock = conn.clock();
+        let queue = Queue::new();
+        let mut sink = queue.sink();
+        block_on(pump(&mut conn, Command::Read, &queue, async {
+            for block in 1..=5_u64 {
+                sink(Progress::Debug(format!("block {block}")));
+                sink(count(block));
+                yield_once().await;
+            }
+            clock.set(clock.get() + COUNT_INTERVAL);
+            sink(count(6));
+            yield_once().await;
+        }))?;
+        assert_eq!(counts_sent(&conn.sent()), ["1 bytes", "6 bytes"]);
+        assert_eq!(
+            conn.sent()
+                .iter()
+                .filter(|frame| matches!(frame, Sent::Debug(_)))
+                .count(),
+            5,
+            "the narration itself all goes out"
+        );
         Ok(())
     }
 }
