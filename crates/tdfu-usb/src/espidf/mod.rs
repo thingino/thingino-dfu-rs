@@ -24,6 +24,7 @@ mod transport;
 
 use core::ffi::CStr;
 use core::time::Duration;
+use std::ffi::CString;
 use std::thread;
 
 use esp_idf_sys as sys;
@@ -86,12 +87,29 @@ fn status_error(status: sys::usb_transfer_status_t, pipe: Pipe) -> Result<(), Us
 }
 
 fn spawn(name: &str, body: impl FnOnce() + Send + 'static) -> Result<(), UsbError> {
-    thread::Builder::new()
+    let failed = |err: String| UsbError::new(UsbErrorKind::Backend(format!("spawning {name}: {err}")), Pipe::Device);
+    // FreeRTOS names the task from the pthread configuration, not from the Rust thread's
+    // name; without this every thread in a task list reads `pthread`.
+    let task_name = CString::new(name).map_err(|err| failed(err.to_string()))?;
+    // SAFETY: no arguments; it returns a plain struct.
+    let mut base = unsafe { sys::esp_pthread_get_default_config() };
+    // SAFETY: `base` outlives the call, which overwrites it only when this thread has a
+    // configuration of its own; that one is restored below.
+    unsafe { sys::esp_pthread_get_cfg(&raw mut base) };
+    let named = sys::esp_pthread_cfg_t {
+        thread_name: task_name.as_ptr(),
+        ..base
+    };
+    // SAFETY: the call copies the configuration; the name it points to outlives the spawn,
+    // and task creation copies the name in turn.
+    unsafe { sys::esp_pthread_set_cfg(&raw const named) };
+    let spawned = thread::Builder::new()
         .name(name.to_owned())
         .stack_size(TASK_STACK)
-        .spawn(body)
-        .map(drop)
-        .map_err(|err| UsbError::new(UsbErrorKind::Backend(format!("spawning {name}: {err}")), Pipe::Device))
+        .spawn(body);
+    // SAFETY: as above, and `base` names no memory of this function's.
+    unsafe { sys::esp_pthread_set_cfg(&raw const base) };
+    spawned.map(drop).map_err(|err| failed(err.to_string()))
 }
 
 /// Host side only: halting and flushing completes whatever is queued as cancelled.
