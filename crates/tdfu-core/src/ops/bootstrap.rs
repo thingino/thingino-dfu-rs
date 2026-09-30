@@ -119,6 +119,9 @@ pub async fn bootstrap_from<T: LocalUsbTransport, C: Sleeper, S: AsyncSource>(
         stage1.len()
     )));
     bootrom::load_to_memory(dev, clock, SPL_LOAD_ADDR, &stage1, &mut *progress).await?;
+    // Freed before U-Boot streams through: on a daemon without external RAM that stretch
+    // is the bootstrap's lowest free memory, and the padded copy is up to 34 KB.
+    drop(stage1);
     bootrom::prog_stage1(dev, clock, SPL_ENTRY_ADDR).await?;
 
     clock.sleep(POST_STAGE1_SETTLE).await;
