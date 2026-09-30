@@ -17,8 +17,13 @@ use tokio::net::TcpStream;
 
 use super::error::DaemonError;
 
-/// How much is read from the socket in one go.
+/// How much is read from the socket in one go. On a microcontroller the TCP window is a
+/// few kilobytes (5760 bytes by ESP-IDF's default), so a read never returns more than
+/// that, and a bigger buffer would be memory held for nothing.
+#[cfg(not(target_os = "espidf"))]
 const CHUNK: usize = 16 * 1024;
+#[cfg(target_os = "espidf")]
+const CHUNK: usize = 4 * 1024;
 
 /// The three deadlines, and what each one is for.
 ///

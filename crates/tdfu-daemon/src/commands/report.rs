@@ -109,8 +109,9 @@ const INTAKE_STEP: usize = 4 * 1024;
 
 /// The most an operation should hold of a streamed payload at once, which the intake
 /// asks of it ([`AsyncSource::hold_at_most`]): a bootrom chunk is 64 KiB, and a daemon on
-/// a microcontroller without external RAM has no 64 KiB block to give it.
-pub const INTAKE_HOLD: usize = 16 * 1024;
+/// a microcontroller without external RAM has no 64 KiB block to give it. One step: its
+/// TCP window is a few kilobytes, so a larger piece only waits longer on the network.
+pub const INTAKE_HOLD: usize = INTAKE_STEP;
 
 /// How much of a streamed reply an operation may leave before it waits for the pump.
 const OUTBOX_CAPACITY: usize = 4 * 1024;
