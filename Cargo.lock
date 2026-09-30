@@ -1482,7 +1482,7 @@ dependencies = [
 
 [[package]]
 name = "tdfu-cli"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "clap",
  "socket2",
@@ -1496,7 +1496,7 @@ dependencies = [
 
 [[package]]
 name = "tdfu-core"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "tdfu-usb",
  "thiserror 2.0.20",
@@ -1504,7 +1504,7 @@ dependencies = [
 
 [[package]]
 name = "tdfu-daemon"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "socket2",
  "tdfu-core",
@@ -1518,7 +1518,7 @@ dependencies = [
 
 [[package]]
 name = "tdfu-jni"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "jni",
  "tdfu-core",
@@ -1528,7 +1528,7 @@ dependencies = [
 
 [[package]]
 name = "tdfu-proto"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "proptest",
  "thiserror 2.0.20",
@@ -1536,7 +1536,7 @@ dependencies = [
 
 [[package]]
 name = "tdfu-usb"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "esp-idf-sys",
  "nusb",
@@ -1546,7 +1546,7 @@ dependencies = [
 
 [[package]]
 name = "tdfu-wasm"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "js-sys",
  "tdfu-core",
@@ -2248,7 +2248,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "xtask"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "flate2",
  "serde",
