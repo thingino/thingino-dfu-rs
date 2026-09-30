@@ -89,6 +89,9 @@ pub struct EspTransport {
     /// The control transfer, kept between requests like the bulk one: a DFU image is
     /// thousands of 4 KiB blocks, each a control transfer of its own.
     control: RefCell<Option<Transfer>>,
+    /// Set once the handle is closed while this transport lives on: every call answers
+    /// `NoDevice` and nothing touches the handle again.
+    released: Cell<bool>,
 }
 
 impl fmt::Debug for EspTransport {
@@ -114,6 +117,7 @@ impl EspTransport {
             ep0_inflight: RefCell::new(handle.ep0_inflight),
             bulk: RefCell::new(None),
             control: RefCell::new(None),
+            released: Cell::new(false),
         }
     }
 
@@ -121,12 +125,28 @@ impl EspTransport {
         self.dev.get().0
     }
 
+    /// Whether the device has left. The first time it is seen gone its handle is closed,
+    /// rather than when the transport is dropped: the library enumerates the next device on
+    /// the port (the DFU gadget, after a bootstrap) only once every handle on the old one is
+    /// closed, and the caller may spend 6.5 s retrying a vendor request first.
+    fn gone(&self) -> bool {
+        if self.released.get() {
+            return true;
+        }
+        if !self.shared.is_gone(self.dev()) {
+            return false;
+        }
+        self.close();
+        self.released.set(true);
+        true
+    }
+
     fn control(&self, setup: Setup, out: &[u8], in_len: u16, timeout: Duration) -> Result<Vec<u8>, UsbError> {
         let pipe = Pipe::Control {
             direction: setup.direction,
             request: setup.request,
         };
-        if self.shared.is_gone(self.dev()) {
+        if self.gone() {
             return Err(UsbError::new(UsbErrorKind::NoDevice, pipe));
         }
         // IDF wants an IN data stage rounded up to the packet size, and an OUT one exact.
@@ -331,6 +351,9 @@ impl EspTransport {
     /// Parks the handle for the next open while the device is here and nothing is stuck on
     /// it; otherwise closes it, now or once its abandoned control transfers complete.
     fn close(&self) {
+        if self.released.get() {
+            return;
+        }
         let dev = self.dev();
         let ep0_inflight = Arc::clone(&self.ep0_inflight.borrow());
         self.claim.borrow_mut().take();
@@ -455,6 +478,9 @@ impl LocalUsbTransport for EspTransport {
     }
 
     async fn bulk_out(&self, data: &[u8], timeout: Duration) -> Result<usize, UsbError> {
+        if self.gone() {
+            return Err(UsbError::new(UsbErrorKind::NoDevice, Pipe::Device));
+        }
         let Some((endpoint, _)) = self.claimed().and_then(|claim| claim.bulk_out) else {
             return Err(Self::not_claimed(Pipe::Device));
         };
@@ -465,6 +491,9 @@ impl LocalUsbTransport for EspTransport {
     }
 
     async fn bulk_in(&self, len: usize, timeout: Duration) -> Result<Vec<u8>, UsbError> {
+        if self.gone() {
+            return Err(UsbError::new(UsbErrorKind::NoDevice, Pipe::Device));
+        }
         let Some((endpoint, mps)) = self.claimed().and_then(|claim| claim.bulk_in) else {
             return Err(Self::not_claimed(Pipe::Device));
         };
@@ -488,6 +517,9 @@ impl LocalUsbTransport for EspTransport {
     }
 
     async fn claim_interface(&self, spec: InterfaceSpec) -> Result<(), UsbError> {
+        if self.gone() {
+            return Err(UsbError::new(UsbErrorKind::NoDevice, Pipe::Device));
+        }
         let locate = |endpoint: Option<BulkEndpoint>| -> Result<Option<(BulkEndpoint, usize)>, UsbError> {
             endpoint
                 .map(|endpoint| {
@@ -541,6 +573,9 @@ impl LocalUsbTransport for EspTransport {
     }
 
     async fn clear_halt(&self, endpoint: BulkEndpoint) -> Result<(), UsbError> {
+        if self.gone() {
+            return Err(UsbError::new(UsbErrorKind::NoDevice, Pipe::Bulk(endpoint)));
+        }
         let Some(claim) = self
             .claimed()
             .filter(|claim| claim.endpoints().any(|declared| declared == endpoint))
@@ -582,24 +617,28 @@ impl LocalUsbTransport for EspTransport {
             Pipe::Device,
             "root port off",
         )?;
-        self.shared
-            .wait_until(DEVICE_GONE_TIMEOUT, |state| state.gone.contains(&Raw(old)));
         let ep0_inflight = self.ep0_inflight.replace(Arc::new(AtomicUsize::new(0)));
-        let drained = Instant::now() + DEVICE_GONE_TIMEOUT;
-        while ep0_inflight.load(Ordering::SeqCst) > 0 && Instant::now() < drained {
-            thread::sleep(Duration::from_millis(10));
-        }
-        if ep0_inflight.load(Ordering::SeqCst) == 0 {
-            // SAFETY: the old handle holds no interface and has nothing in flight.
-            unsafe { sys::usb_host_device_close(client, old) };
-            self.shared.forget(old, self.address.get());
-        } else {
-            self.shared.defer(Deferred {
-                dev: Raw(old),
-                address: self.address.get(),
-                ep0_inflight,
-                since: Instant::now(),
-            });
+        if !self.released.get() {
+            self.shared
+                .wait_until(DEVICE_GONE_TIMEOUT, |state| state.gone.contains(&Raw(old)));
+            let drained = Instant::now() + DEVICE_GONE_TIMEOUT;
+            while ep0_inflight.load(Ordering::SeqCst) > 0 && Instant::now() < drained {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if ep0_inflight.load(Ordering::SeqCst) == 0 {
+                // SAFETY: the old handle holds no interface and has nothing in flight.
+                unsafe { sys::usb_host_device_close(client, old) };
+                self.shared.forget(old, self.address.get());
+            } else {
+                self.shared.defer(Deferred {
+                    dev: Raw(old),
+                    address: self.address.get(),
+                    ep0_inflight,
+                    since: Instant::now(),
+                });
+            }
+            // Until a new handle opens, the old one is not this transport's to use.
+            self.released.set(true);
         }
         // SAFETY: the library is installed.
         check(
@@ -608,7 +647,9 @@ impl LocalUsbTransport for EspTransport {
             "root port on",
         )?;
         let want = (self.descriptors.vendor_id, self.descriptors.product_id);
-        self.reopen(want, Instant::now() + REENUMERATE_TIMEOUT)
+        self.reopen(want, Instant::now() + REENUMERATE_TIMEOUT)?;
+        self.released.set(false);
+        Ok(())
     }
 
     fn descriptors(&self) -> &DeviceDescriptors {
