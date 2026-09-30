@@ -86,6 +86,9 @@ pub struct EspTransport {
     /// buffer is a [`CHUNK`] of DMA memory in one block: allocated once per opening, a
     /// heap too fragmented for another block that size cannot fail an image halfway.
     bulk: RefCell<Option<Transfer>>,
+    /// The control transfer, kept between requests like the bulk one: a DFU image is
+    /// thousands of 4 KiB blocks, each a control transfer of its own.
+    control: RefCell<Option<Transfer>>,
 }
 
 impl fmt::Debug for EspTransport {
@@ -110,6 +113,7 @@ impl EspTransport {
             idf_claimed: Cell::new(handle.idf_claimed),
             ep0_inflight: RefCell::new(handle.ep0_inflight),
             bulk: RefCell::new(None),
+            control: RefCell::new(None),
         }
     }
 
@@ -133,8 +137,7 @@ impl EspTransport {
                 out.len(),
             ),
         };
-        let inflight = Arc::clone(&self.ep0_inflight.borrow());
-        let mut transfer = Transfer::alloc(SETUP_LEN + data_len, pipe, Some(inflight))?;
+        let mut transfer = self.take_control(SETUP_LEN + data_len, pipe)?;
         let buffer = transfer.buffer();
         buffer[0] = request_type(setup.direction, setup.control_type, setup.recipient);
         buffer[1] = setup.request;
@@ -153,16 +156,38 @@ impl EspTransport {
             timeout,
             pipe,
         )?;
-        status_error(transfer.status(), pipe)?;
-        // `actual_num_bytes` counts the setup packet.
-        let got = transfer.actual().saturating_sub(SETUP_LEN);
-        match setup.direction {
-            Direction::In => {
-                let got = got.min(usize::from(in_len));
-                Ok(transfer.buffer()[SETUP_LEN..SETUP_LEN + got].to_vec())
+        let reply = status_error(transfer.status(), pipe).and_then(|()| {
+            // `actual_num_bytes` counts the setup packet.
+            let got = transfer.actual().saturating_sub(SETUP_LEN);
+            match setup.direction {
+                Direction::In => {
+                    let got = got.min(usize::from(in_len));
+                    Ok(transfer.buffer()[SETUP_LEN..SETUP_LEN + got].to_vec())
+                }
+                Direction::Out if got < out.len() => {
+                    Err(UsbError::new(UsbErrorKind::Short { got, want: out.len() }, pipe))
+                }
+                Direction::Out => Ok(Vec::new()),
             }
-            Direction::Out if got < out.len() => Err(UsbError::new(UsbErrorKind::Short { got, want: out.len() }, pipe)),
-            Direction::Out => Ok(Vec::new()),
+        });
+        self.keep_control(transfer);
+        reply
+    }
+
+    /// The kept control transfer when it is big enough and counts its abandonment against
+    /// the current handle, or a new one of `len` bytes.
+    fn take_control(&self, len: usize, pipe: Pipe) -> Result<Transfer, UsbError> {
+        let inflight = Arc::clone(&self.ep0_inflight.borrow());
+        match self.control.borrow_mut().take() {
+            Some(kept) if kept.capacity() >= len && kept.counts_for(&inflight) => Ok(kept),
+            _ => Transfer::alloc(len, pipe, Some(inflight)),
+        }
+    }
+
+    /// Keeps `transfer` for the next control request, unless it was abandoned in flight.
+    fn keep_control(&self, transfer: Transfer) {
+        if transfer.owned() {
+            *self.control.borrow_mut() = Some(transfer);
         }
     }
 
@@ -310,6 +335,7 @@ impl EspTransport {
         let ep0_inflight = Arc::clone(&self.ep0_inflight.borrow());
         self.claim.borrow_mut().take();
         self.bulk.borrow_mut().take();
+        self.control.borrow_mut().take();
         if ep0_inflight.load(Ordering::SeqCst) == 0 && !self.shared.is_gone(dev) {
             self.shared.park(Handle {
                 dev: Raw(dev),
@@ -544,6 +570,7 @@ impl LocalUsbTransport for EspTransport {
         let client = self.shared.client();
         let old = self.dev();
         self.claim.borrow_mut().take();
+        self.control.borrow_mut().take();
         self.release_idf();
         // No device-reset call exists in IDF 5.5. Powering the root port off and on bus-resets
         // and re-enumerates the device without cutting VBUS, and it is also the only thing

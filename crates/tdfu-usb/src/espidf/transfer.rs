@@ -82,6 +82,20 @@ impl Transfer {
         unsafe { core::slice::from_raw_parts_mut((*self.raw).data_buffer, (*self.raw).data_buffer_size) }
     }
 
+    /// The most bytes one submission can carry.
+    pub(super) fn capacity(&self) -> usize {
+        // SAFETY: the library sets the size at allocation and never changes it.
+        unsafe { (*self.raw).data_buffer_size }
+    }
+
+    /// Whether an abandonment of this transfer counts against `inflight`.
+    pub(super) fn counts_for(&self, inflight: &Arc<AtomicUsize>) -> bool {
+        self.completion
+            .ep0_inflight
+            .as_ref()
+            .is_some_and(|mine| Arc::ptr_eq(mine, inflight))
+    }
+
     pub(super) fn prepare(&mut self, dev: DevHandle, endpoint: u8, len: usize, pipe: Pipe) -> Result<(), UsbError> {
         let num_bytes = i32::try_from(len).map_err(|_| UsbError::new(UsbErrorKind::Fault, pipe).with_len(len))?;
         // SAFETY: the transfer is owned and not in flight, so its fields are ours to set.
