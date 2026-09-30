@@ -29,7 +29,9 @@ use crate::{
 const SETUP_LEN: usize = 8;
 /// The largest single transfer buffer. It is DMA memory, which the S3 has little of, and a
 /// multiple of every bulk max packet size so that splitting never inserts a short packet.
-const CHUNK: usize = 16 * 1024;
+/// A streamed image arrives through the daemon 4 KiB at a time, so a bigger buffer would
+/// sit mostly empty.
+const CHUNK: usize = 4 * 1024;
 const DEVICE_GONE_TIMEOUT: Duration = Duration::from_secs(2);
 const REENUMERATE_TIMEOUT: Duration = Duration::from_secs(10);
 
